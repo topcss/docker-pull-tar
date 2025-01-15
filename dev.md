@@ -17,7 +17,7 @@ pipenv shell
 
 ``` bat
 @REM 安装依赖，在虚拟环境中
-pip install pyinstaller requests urllib3 -i https://pypi.tuna.tsinghua.edu.cn/simple/
+pip install pyinstaller requests urllib3 tqdm -i https://pypi.tuna.tsinghua.edu.cn/simple/
 @REM 打包
 pyinstaller -F -n DockerPull.exe -i favicon.ico docker_image_puller.py
 @REM 卸载依赖

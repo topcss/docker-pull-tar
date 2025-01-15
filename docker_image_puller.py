@@ -7,6 +7,7 @@ import shutil
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from tqdm import tqdm
 import tarfile
 import urllib3
 urllib3.disable_warnings()
@@ -130,12 +131,19 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
         try:
             bresp = session.get(f'https://{registry}/v2/{repository}/blobs/{ublob}', headers=auth_head, stream=True, verify=False, timeout=30)
             bresp.raise_for_status()
+            
+            # 使用 tqdm 显示下载进度
+            total_size = int(bresp.headers.get('content-length', 0))
+            with tqdm(total=total_size, unit='B', unit_scale=True, desc=f'Downloading {ublob[:12]}') as pbar:
+                with open(f'{layerdir}/layer_gzip.tar', 'wb') as file:
+                    for chunk in bresp.iter_content(chunk_size=1024):
+                        if chunk:
+                            file.write(chunk)
+                            pbar.update(len(chunk))
+        
         except requests.exceptions.RequestException as e:
             print(f'下载层错误：{e}')
             exit(1)
-        
-        with open(f'{layerdir}/layer_gzip.tar', 'wb') as file:
-            shutil.copyfileobj(bresp.raw, file)
         
         with open(f'{layerdir}/layer.tar', 'wb') as file:
             with gzip.open(f'{layerdir}/layer_gzip.tar', 'rb') as gz:
@@ -229,6 +237,7 @@ def main():
     if not os.path.exists(imgdir):
         os.makedirs(imgdir)
     
+    print('开始下载层...')
     download_layers(session, registry, repository, layers, auth_head, imgdir, resp_json, imgparts, img, tag)
     
     create_image_tar(imgdir, repo, img)
