@@ -61,8 +61,39 @@ Docker 镜像已拉取：library_alpine.tar
 
 #### 命令行模式
 
+### 基本用法
+
 ```bash
-python docker_image_puller.py library/ubuntu:latest amd64 docker.xuanyuan.me
+python docker_image_puller.py [选项]
+```
+
+### 参数说明
+
+- `-h, --help`：显示帮助信息。
+- `-v, --version`：显示版本信息。
+- `-i, --image`：指定 Docker 镜像名称（例如：library/ubuntu:latest）。
+- `-a, --arch`：指定架构（默认：amd64）。
+- `-r, --registry`：指定 Docker 仓库地址（默认：docker.xuanyuan.me）。
+- `--debug`：启用调试模式，打印详细日志。
+
+### 示例
+
+#### 显示帮助信息
+
+```bash
+python docker_image_puller.py -h
+```
+
+#### 查看版本信息
+
+```bash
+python docker_image_puller.py -v
+```
+
+#### 指定镜像名称、架构和仓库地址
+
+```bash
+python docker_image_puller.py -i alpine -a arm64 -r 1ms.run --debug
 ```
 
 ## 内网 Docker 导入方法
@@ -142,6 +173,12 @@ python docker_image_puller.py library/ubuntu:latest amd64 docker.xuanyuan.me
     - [示例](#示例)
       - [交互式模式](#交互式模式)
       - [命令行模式](#命令行模式)
+    - [基本用法](#基本用法-1)
+    - [参数说明](#参数说明)
+    - [示例](#示例-1)
+      - [显示帮助信息](#显示帮助信息)
+      - [查看版本信息](#查看版本信息)
+      - [指定镜像名称、架构和仓库地址](#指定镜像名称架构和仓库地址)
   - [内网 Docker 导入方法](#内网-docker-导入方法)
   - [许可证](#许可证)
   - [联系方式](#联系方式)
