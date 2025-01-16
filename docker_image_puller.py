@@ -17,7 +17,7 @@ import logging
 urllib3.disable_warnings()
 
 # 版本号
-VERSION = "1.0.0"
+VERSION = "v1.0.3"
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
