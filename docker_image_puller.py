@@ -45,7 +45,7 @@ def create_session():
         'http': os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy'),
         'https': os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
     }
-    if session.proxies:
+    if session.proxies.get('http') or session.proxies.get('https'):
         logger.info('使用代理设置从环境变量')
 
     return session
@@ -96,7 +96,7 @@ def select_manifest(resp_json, arch):
         platform = m.get('platform', {})
         if platform.get('os') == 'linux' and platform.get('architecture') == arch:
             return m
-    return resp_json.get('manifests', [{}])[0]
+    raise RuntimeError(f'您指定的架构 {arch} 不支持')
 
 def download_layers(session, registry, repository, layers, auth_head, imgdir, resp_json, imgparts, img, tag):
     """下载镜像层"""
@@ -198,21 +198,27 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
     with open(f'{imgdir}/repositories', 'w') as file:
         json.dump({repo_tag: {tag: fake_layerid}}, file)
 
-def create_image_tar(imgdir, repo, img):
+def create_image_tar(imgdir, repo, img, arch):
     """将镜像打包为 tar 文件"""
-    docker_tar = f'{repo.replace("/", "_")}_{img}.tar'
-    with tarfile.open(docker_tar, "w") as tar:
-        tar.add(imgdir, arcname='/')
-    shutil.rmtree(imgdir)
-    logger.info(f'Docker 镜像已拉取：{docker_tar}')
+    docker_tar = f'{repo.replace("/", "_")}_{img}_{arch}.tar'
+    try:
+        with tarfile.open(docker_tar, "w") as tar:
+            tar.add(imgdir, arcname='/')
+        logger.info(f'Docker 镜像已拉取：{docker_tar}')
+    except Exception as e:
+        logger.error(f'打包镜像失败: {e}')
+        raise
 
 def cleanup_tmp_dir():
     """删除 tmp 目录"""
     tmp_dir = 'tmp'
-    if os.path.exists(tmp_dir):
-        logger.info(f'清理临时目录: {tmp_dir}')
-        shutil.rmtree(tmp_dir)
-        logger.info('临时目录已清理。')
+    try:
+        if os.path.exists(tmp_dir):
+            logger.info(f'清理临时目录: {tmp_dir}')
+            shutil.rmtree(tmp_dir)
+            logger.info('临时目录已清理。')
+    except Exception as e:
+        logger.error(f'清理临时目录失败: {e}')
 
 def main():
     """主函数"""
@@ -229,6 +235,14 @@ def main():
 
         args = parser.parse_args()
 
+        if args.debug:
+            logger.setLevel(logging.DEBUG)
+
+        # 获取仓库地址
+        if not args.registry:
+            args.registry = input("请输入 Docker 仓库地址（默认：docker.xuanyuan.me）：").strip() or 'docker.xuanyuan.me'
+
+        # 获取镜像名称
         if not args.image:
             args.image = input("请输入 Docker 镜像名称（例如：library/ubuntu:latest）：").strip()
             if not args.image:
@@ -238,13 +252,6 @@ def main():
         # 获取架构
         if not args.arch:
             args.arch = input("请输入架构（默认：amd64）：").strip() or 'amd64'
-        
-        # 获取仓库地址
-        if not args.registry:
-            args.registry = input("请输入 Docker 仓库地址（默认：docker.xuanyuan.me）：").strip() or 'docker.xuanyuan.me'
-
-        if args.debug:
-            logger.setLevel(logging.DEBUG)
 
         repo, img, tag = parse_image_input(args.image)
         repository = f'{repo}/{img}'
@@ -295,19 +302,23 @@ def main():
         download_layers(session, args.registry, repository, resp_json['layers'], auth_head, imgdir, resp_json, [repo], img, tag)
 
         # 打包镜像
-        create_image_tar(imgdir, repo, img)
+        create_image_tar(imgdir, repo, img, args.arch)
 
     except KeyboardInterrupt:
         logger.info('用户取消操作。')
-        cleanup_tmp_dir()
-
     except requests.exceptions.RequestException as e:
         logger.error(f'网络连接失败: {e}')
-
+    except json.JSONDecodeError as e:
+        logger.error(f'JSON解析失败: {e}')
+    except FileNotFoundError as e:
+        logger.error(f'文件操作失败: {e}')
+    except argparse.ArgumentError as e:
+        logger.error(f'命令行参数错误: {e}')
     except Exception as e:
         logger.error(f'程序运行过程中发生异常: {e}')
 
     finally:
+        cleanup_tmp_dir()
         input("按任意键退出程序...")
         sys.exit(0)
 
