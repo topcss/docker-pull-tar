@@ -13,14 +13,19 @@ import urllib3
 import argparse
 import logging
 
+# Set default encoding to UTF-8
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 # 禁用 SSL 警告
 urllib3.disable_warnings()
 
 # 版本号
-VERSION = "v1.0.3"
+VERSION = "v1.0.4"
 
 # 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', encoding='utf-8')
 logger = logging.getLogger(__name__)
 
 def create_session():
@@ -60,11 +65,11 @@ def parse_image_input(image_input):
 
     return repo, img, tag
 
-def get_auth_head(session, auth_url, reg_service, repository, debug=False):
+def get_auth_head(session, auth_url, reg_service, repository):
     """获取认证头"""
-    url = f'{auth_url}?service={reg_service}&scope=repository:{repository}:pull'
-    logger.debug(f'请求认证 URL: {url}')
     try:
+        url = f'{auth_url}?service={reg_service}&scope=repository:{repository}:pull'
+        logger.debug(f'获取认证头 URL: {url}')
         resp = session.get(url, verify=False, timeout=30)
         resp.raise_for_status()
         access_token = resp.json()['token']
@@ -73,11 +78,11 @@ def get_auth_head(session, auth_url, reg_service, repository, debug=False):
         logger.error(f'请求认证失败: {e}')
         raise
 
-def fetch_manifest(session, registry, repository, tag, auth_head, debug=False):
+def fetch_manifest(session, registry, repository, tag, auth_head):
     """获取镜像清单"""
-    url = f'https://{registry}/v2/{repository}/manifests/{tag}'
-    logger.debug(f'请求清单 URL: {url}')
     try:
+        url = f'https://{registry}/v2/{repository}/manifests/{tag}'
+        logger.debug(f'获取镜像清单 URL: {url}')
         resp = session.get(url, headers=auth_head, verify=False, timeout=30)
         resp.raise_for_status()
         return resp
@@ -93,12 +98,12 @@ def select_manifest(resp_json, arch):
             return m
     return resp_json.get('manifests', [{}])[0]
 
-def download_layers(session, registry, repository, layers, auth_head, imgdir, resp_json, imgparts, img, tag, debug=False):
+def download_layers(session, registry, repository, layers, auth_head, imgdir, resp_json, imgparts, img, tag):
     """下载镜像层"""
-    config = resp_json['config']['digest']
-    url = f'https://{registry}/v2/{repository}/blobs/{config}'
-    logger.debug(f'请求配置 URL: {url}')
     try:
+        config = resp_json['config']['digest']
+        url = f'https://{registry}/v2/{repository}/blobs/{config}'
+        logger.debug(f'请求配置 URL: {url}')
         with session.get(url, headers=auth_head, verify=False, timeout=30, stream=True) as confresp:
             confresp.raise_for_status()
             with open(f'{imgdir}/{config[7:]}.json', 'wb') as file:
@@ -146,10 +151,10 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
         with open(f'{layerdir}/VERSION', 'w') as file:
             file.write('1.0')
 
-        # 下载压缩的镜像层
-        url = f'https://{registry}/v2/{repository}/blobs/{ublob}'
-        logger.debug(f'请求层 URL: {url}')
         try:
+            # 下载压缩的镜像层
+            url = f'https://{registry}/v2/{repository}/blobs/{ublob}'
+            logger.debug(f'请求层 URL: {url}')
             with session.get(url, headers=auth_head, verify=False, timeout=30, stream=True) as bresp:
                 bresp.raise_for_status()
                 total_size = int(bresp.headers.get('content-length', 0))
@@ -250,11 +255,13 @@ def main():
 
         # 获取认证信息
         try:
-            resp = session.get(f'https://{args.registry}/v2/', verify=False, timeout=30)
+            url = f'https://{args.registry}/v2/'
+            logger.debug(f'获取认证信息 URL: {url}')
+            resp = session.get(url, verify=False, timeout=30)
             if resp.status_code == 401:
                 auth_url = resp.headers['WWW-Authenticate'].split('"')[1]
                 reg_service = resp.headers['WWW-Authenticate'].split('"')[3]
-                auth_head = get_auth_head(session, auth_url, reg_service, repository, args.debug)
+                auth_head = get_auth_head(session, auth_url, reg_service, repository)
             else:
                 auth_head = {'Accept': 'application/vnd.docker.distribution.manifest.v2+json'}
         except requests.exceptions.RequestException as e:
@@ -262,13 +269,15 @@ def main():
             raise
 
         # 获取清单
-        resp = fetch_manifest(session, args.registry, repository, tag, auth_head, args.debug)
+        resp = fetch_manifest(session, args.registry, repository, tag, auth_head)
         resp_json = resp.json()
 
         # 选择适合的清单
         selected_manifest = select_manifest(resp_json, args.arch)
         if selected_manifest:
-            manifest_resp = session.get(f'https://{args.registry}/v2/{repository}/manifests/{selected_manifest["digest"]}', headers=auth_head, verify=False, timeout=30)
+            url = f'https://{args.registry}/v2/{repository}/manifests/{selected_manifest["digest"]}'
+            logger.debug(f'获取清单 URL: {url}')
+            manifest_resp = session.get(url, headers=auth_head, verify=False, timeout=30)
             manifest_resp.raise_for_status()
             resp_json = manifest_resp.json()
 
@@ -280,7 +289,7 @@ def main():
         imgdir = 'tmp'
         os.makedirs(imgdir, exist_ok=True)
         logger.info('开始下载层...')
-        download_layers(session, args.registry, repository, resp_json['layers'], auth_head, imgdir, resp_json, [repo], img, tag, args.debug)
+        download_layers(session, args.registry, repository, resp_json['layers'], auth_head, imgdir, resp_json, [repo], img, tag)
 
         # 打包镜像
         create_image_tar(imgdir, repo, img)
@@ -288,18 +297,16 @@ def main():
     except KeyboardInterrupt:
         logger.info('用户取消操作。')
         cleanup_tmp_dir()
-        sys.exit(0)
 
     except requests.exceptions.RequestException as e:
         logger.error(f'网络连接失败: {e}')
-        sys.exit(1)
 
     except Exception as e:
         logger.error(f'程序运行过程中发生异常: {e}')
-        sys.exit(1)
 
     finally:
         input("按任意键退出程序...")
+        sys.exit(0)
 
 if __name__ == '__main__':
     main()
