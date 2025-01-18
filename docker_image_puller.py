@@ -22,7 +22,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 urllib3.disable_warnings()
 
 # 版本号
-VERSION = "v1.0.4"
+VERSION = "v1.0.5"
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', encoding='utf-8')
@@ -216,33 +216,36 @@ def cleanup_tmp_dir():
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description="Docker 镜像拉取工具")
-    parser.add_argument("-i", "--image", required=False, help="Docker 镜像名称（例如：library/ubuntu:latest）")
-    parser.add_argument("-a", "--arch", help="架构（默认：amd64）")
-    parser.add_argument("-r", "--registry", help="Docker 仓库地址（默认：docker.xuanyuan.me）")
-    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}", help="显示版本信息")
-    parser.add_argument("--debug", action="store_true", help="启用调试模式，打印请求 URL 和连接状态")
-
-    args = parser.parse_args()
-
-    if not args.image:
-        args.image = input("请输入 Docker 镜像名称（例如：library/ubuntu:latest）：").strip()
-        if not args.image:
-            logger.error("错误：镜像名称是必填项。")
-            return
-
-    # 获取架构
-    if not args.arch:
-        args.arch = input("请输入架构（默认：amd64）：").strip() or 'amd64'
-    
-    # 获取仓库地址
-    if not args.registry:
-        args.registry = input("请输入 Docker 仓库地址（默认：docker.xuanyuan.me）：").strip() or 'docker.xuanyuan.me'
-
-    if args.debug:
-        logger.setLevel(logging.DEBUG)
-
     try:
+        parser = argparse.ArgumentParser(description="Docker 镜像拉取工具")
+        parser.add_argument("-i", "--image", required=False, help="Docker 镜像名称（例如：library/ubuntu:latest）")
+        parser.add_argument("-a", "--arch", help="架构（默认：amd64）")
+        parser.add_argument("-r", "--registry", help="Docker 仓库地址（默认：docker.xuanyuan.me）")
+        parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}", help="显示版本信息")
+        parser.add_argument("--debug", action="store_true", help="启用调试模式，打印请求 URL 和连接状态")
+
+        # 显示程序的信息
+        logger.info(f'欢迎使用 Docker 镜像拉取工具 {VERSION}')
+
+        args = parser.parse_args()
+
+        if not args.image:
+            args.image = input("请输入 Docker 镜像名称（例如：library/ubuntu:latest）：").strip()
+            if not args.image:
+                logger.error("错误：镜像名称是必填项。")
+                return
+
+        # 获取架构
+        if not args.arch:
+            args.arch = input("请输入架构（默认：amd64）：").strip() or 'amd64'
+        
+        # 获取仓库地址
+        if not args.registry:
+            args.registry = input("请输入 Docker 仓库地址（默认：docker.xuanyuan.me）：").strip() or 'docker.xuanyuan.me'
+
+        if args.debug:
+            logger.setLevel(logging.DEBUG)
+
         repo, img, tag = parse_image_input(args.image)
         repository = f'{repo}/{img}'
 
