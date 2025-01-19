@@ -224,7 +224,7 @@ def main():
     """主函数"""
     try:
         parser = argparse.ArgumentParser(description="Docker 镜像拉取工具")
-        parser.add_argument("-i", "--image", required=False, help="Docker 镜像名称（例如：library/ubuntu:latest）")
+        parser.add_argument("-i", "--image", required=False, help="Docker 镜像名称（例如：library/ubuntu:latest 或者 alpine）")
         parser.add_argument("-a", "--arch", help="架构（默认：amd64）")
         parser.add_argument("-r", "--registry", help="Docker 仓库地址（默认：docker.xuanyuan.me）")
         parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}", help="显示版本信息")
@@ -238,13 +238,9 @@ def main():
         if args.debug:
             logger.setLevel(logging.DEBUG)
 
-        # 获取仓库地址
-        if not args.registry:
-            args.registry = input("请输入 Docker 仓库地址（默认：docker.xuanyuan.me）：").strip() or 'docker.xuanyuan.me'
-
         # 获取镜像名称
         if not args.image:
-            args.image = input("请输入 Docker 镜像名称（例如：library/ubuntu:latest）：").strip()
+            args.image = input("请输入 Docker 镜像名称（例如：library/ubuntu:latest 或者 alpine）：").strip()
             if not args.image:
                 logger.error("错误：镜像名称是必填项。")
                 return
@@ -252,6 +248,10 @@ def main():
         # 获取架构
         if not args.arch:
             args.arch = input("请输入架构（默认：amd64）：").strip() or 'amd64'
+
+        # 获取仓库地址
+        if not args.registry:
+            args.registry = input("请输入 Docker 仓库地址（默认：docker.xuanyuan.me）：").strip() or 'docker.xuanyuan.me'
 
         repo, img, tag = parse_image_input(args.image)
         repository = f'{repo}/{img}'
