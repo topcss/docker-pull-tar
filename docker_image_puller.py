@@ -22,7 +22,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 urllib3.disable_warnings()
 
 # 版本号
-VERSION = "v1.0.5"
+VERSION = "v1.0.6"
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', encoding='utf-8')
@@ -69,11 +69,14 @@ def get_auth_head(session, auth_url, reg_service, repository):
     """获取认证头"""
     try:
         url = f'{auth_url}?service={reg_service}&scope=repository:{repository}:pull'
-        logger.debug(f'获取认证头 URL: {url}')
+        # 打印 curl 命令
+        logger.debug(f"获取认证头 CURL 命令: curl '{url}'")
         resp = session.get(url, verify=False, timeout=30)
         resp.raise_for_status()
         access_token = resp.json()['token']
-        return {'Authorization': f'Bearer {access_token}', 'Accept': 'application/vnd.docker.distribution.manifest.v2+json'}
+        auth_head = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/vnd.docker.distribution.manifest.v2+json'}
+        
+        return auth_head
     except requests.exceptions.RequestException as e:
         logger.error(f'请求认证失败: {e}')
         raise
@@ -82,7 +85,10 @@ def fetch_manifest(session, registry, repository, tag, auth_head):
     """获取镜像清单"""
     try:
         url = f'https://{registry}/v2/{repository}/manifests/{tag}'
-        logger.debug(f'获取镜像清单 URL: {url}')
+        # 打印 curl 命令
+        headers = ' '.join([f"-H '{key}: {value}'" for key, value in auth_head.items()])
+        curl_command = f"curl '{url}' {headers}"
+        logger.debug(f'获取镜像清单 CURL 命令: {curl_command}')
         resp = session.get(url, headers=auth_head, verify=False, timeout=30)
         resp.raise_for_status()
         return resp
@@ -103,7 +109,10 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
     try:
         config = resp_json['config']['digest']
         url = f'https://{registry}/v2/{repository}/blobs/{config}'
-        logger.debug(f'请求配置 URL: {url}')
+        # 打印 curl 命令
+        headers = ' '.join([f"-H '{key}: {value}'" for key, value in auth_head.items()])
+        curl_command = f"curl '{url}' {headers}"
+        logger.debug(f'下载镜像层 CURL 命令: {curl_command}')
         with session.get(url, headers=auth_head, verify=False, timeout=30, stream=True) as confresp:
             confresp.raise_for_status()
             with open(f'{imgdir}/{config[7:]}.json', 'wb') as file:
@@ -154,7 +163,10 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
         try:
             # 下载压缩的镜像层
             url = f'https://{registry}/v2/{repository}/blobs/{ublob}'
-            logger.debug(f'请求层 URL: {url}')
+            # 打印 curl 命令
+            headers = ' '.join([f"-H '{key}: {value}'" for key, value in auth_head.items()])
+            curl_command = f"curl '{url}' {headers}"
+            logger.debug(f'下载压缩的镜像层 CURL 命令: {curl_command}')
             with session.get(url, headers=auth_head, verify=False, timeout=30, stream=True) as bresp:
                 bresp.raise_for_status()
                 total_size = int(bresp.headers.get('content-length', 0))
@@ -266,7 +278,8 @@ def main():
         # 获取认证信息
         try:
             url = f'https://{args.registry}/v2/'
-            logger.debug(f'获取认证信息 URL: {url}')
+            # 打印 curl 命令
+            logger.debug(f"获取认证信息 CURL 命令: curl '{url}'")
             resp = session.get(url, verify=False, timeout=30)
             if resp.status_code == 401:
                 auth_url = resp.headers['WWW-Authenticate'].split('"')[1]
@@ -286,11 +299,13 @@ def main():
         selected_manifest = select_manifest(resp_json, args.arch)
         if selected_manifest:
             url = f'https://{args.registry}/v2/{repository}/manifests/{selected_manifest["digest"]}'
-            logger.debug(f'获取清单 URL: {url}')
+            # 打印 curl 命令
+            headers = ' '.join([f"-H '{key}: {value}'" for key, value in auth_head.items()])
+            curl_command = f"curl '{url}' {headers}"
+            logger.debug(f'获取架构清单 CURL 命令: {curl_command}')
             manifest_resp = session.get(url, headers=auth_head, verify=False, timeout=30)
             manifest_resp.raise_for_status()
             resp_json = manifest_resp.json()
-
         if 'layers' not in resp_json:
             logger.error('错误：清单中没有层')
             return
