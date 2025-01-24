@@ -102,7 +102,7 @@ def select_manifest(resp_json, arch):
         platform = m.get('platform', {})
         if platform.get('os') == 'linux' and platform.get('architecture') == arch:
             return m
-    raise RuntimeError(f'您指定的架构 {arch} 不支持')
+    # raise RuntimeError(f'您指定的架构 {arch} 不支持')
 
 def download_layers(session, registry, repository, layers, auth_head, imgdir, resp_json, imgparts, img, tag):
     """下载镜像层"""
