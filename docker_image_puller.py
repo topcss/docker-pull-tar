@@ -22,7 +22,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 urllib3.disable_warnings()
 
 # 版本号
-VERSION = "v1.0.6"
+VERSION = "v1.0.7"
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', encoding='utf-8')
@@ -96,13 +96,17 @@ def fetch_manifest(session, registry, repository, tag, auth_head):
         logger.error(f'请求清单失败: {e}')
         raise
 
-def select_manifest(resp_json, arch):
+def select_manifest(manifests, arch):
     """选择适合指定架构的清单"""
-    for m in resp_json.get('manifests', []):
-        platform = m.get('platform', {})
-        if platform.get('os') == 'linux' and platform.get('architecture') == arch:
-            return m
-    # raise RuntimeError(f'您指定的架构 {arch} 不支持')
+    selected_manifest = None
+    for m in manifests:
+        if (m.get('annotations', {}).get('com.docker.official-images.bashbrew.arch') == arch or \
+            m.get('platform',{}).get('architecture') == arch) and \
+            m.get('platform', {}).get('os') == 'linux':
+            selected_manifest = m.get('digest')
+            break
+    return selected_manifest
+   
 
 def download_layers(session, registry, repository, layers, auth_head, imgdir, resp_json, imgparts, img, tag):
     """下载镜像层"""
@@ -257,21 +261,12 @@ def main():
                 logger.error("错误：镜像名称是必填项。")
                 return
 
-        # 获取架构
-        if not args.arch:
-            args.arch = input("请输入架构（默认：amd64）：").strip() or 'amd64'
-
         # 获取仓库地址
         if not args.registry:
             args.registry = input("请输入 Docker 仓库地址（默认：docker.xuanyuan.me）：").strip() or 'docker.xuanyuan.me'
 
         repo, img, tag = parse_image_input(args.image)
         repository = f'{repo}/{img}'
-
-        logger.info(f'仓库地址：{args.registry}')
-        logger.info(f'仓库名：{repository}')
-        logger.info(f'标签：{tag}')
-        logger.info(f'架构：{args.arch}')
 
         session = create_session()
 
@@ -294,21 +289,34 @@ def main():
         # 获取清单
         resp = fetch_manifest(session, args.registry, repository, tag, auth_head)
         resp_json = resp.json()
+        manifests = resp_json.get('manifests')
+        if manifests is not None:
+            archs = [m.get('annotations', {}).get('com.docker.official-images.bashbrew.arch') or m.get('platform',{}).get('architecture') for m in manifests if m.get('platform',{}).get('os') == 'linux']
+            # 打印架构列表
+            logger.info(f'当前可用架构：{", ".join(archs)}')
 
-        # 选择适合的清单
-        selected_manifest = select_manifest(resp_json, args.arch)
-        if selected_manifest:
-            url = f'https://{args.registry}/v2/{repository}/manifests/{selected_manifest["digest"]}'
-            # 打印 curl 命令
-            headers = ' '.join([f"-H '{key}: {value}'" for key, value in auth_head.items()])
-            curl_command = f"curl '{url}' {headers}"
-            logger.debug(f'获取架构清单 CURL 命令: {curl_command}')
-            manifest_resp = session.get(url, headers=auth_head, verify=False, timeout=30)
-            manifest_resp.raise_for_status()
-            resp_json = manifest_resp.json()
+            # 获取架构
+            if not args.arch:
+                args.arch = input("请输入架构（默认：amd64）：").strip() or 'amd64'
+
+            digest = select_manifest(manifests, args.arch)
+            if digest:
+                url = f'https://{args.registry}/v2/{repository}/manifests/{digest}'
+                # 打印 curl 命令
+                headers = ' '.join([f"-H '{key}: {value}'" for key, value in auth_head.items()])
+                curl_command = f"curl '{url}' {headers}"
+                logger.debug(f'获取架构清单 CURL 命令: {curl_command}')
+                manifest_resp = session.get(url, headers=auth_head, verify=False, timeout=30)
+                manifest_resp.raise_for_status()
+                resp_json = manifest_resp.json()
         if 'layers' not in resp_json:
             logger.error('错误：清单中没有层')
             return
+
+        logger.info(f'仓库地址：{args.registry}')
+        logger.info(f'仓库名：{repository}')
+        logger.info(f'标签：{tag}')
+        logger.info(f'架构：{args.arch}')
 
         # 下载镜像层
         imgdir = 'tmp'
