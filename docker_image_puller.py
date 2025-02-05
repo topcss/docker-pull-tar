@@ -121,7 +121,17 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
             confresp.raise_for_status()
             with open(f'{imgdir}/{config[7:]}.json', 'wb') as file:
                 shutil.copyfileobj(confresp.raw, file)
-    except requests.exceptions.RequestException as e:
+            # 检查文件是否为 gzip 压缩格式
+            with open(f'{imgdir}/{config[7:]}.json', 'rb') as file:
+                first_bytes = file.read(4)
+                if first_bytes == b'\x1f\x8b\x08\x00':
+                    # 解压缩 gzip 文件
+                    with gzip.open(f'{imgdir}/{config[7:]}.json', 'rb') as gz, open(f'{imgdir}/{config[7:]}1.json', 'wb') as file:
+                        shutil.copyfileobj(gz, file)
+            if os.path.exists(f'{imgdir}/{config[7:]}1.json'):
+                os.remove(f'{imgdir}/{config[7:]}.json')
+                os.rename(f'{imgdir}/{config[7:]}1.json', f'{imgdir}/{config[7:]}.json')
+    except Exception as e:
         logger.error(f'请求配置失败: {e}')
         raise
 
@@ -190,7 +200,9 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
 
                 # 生成层元数据
                 if layers[-1]['digest'] == layer['digest']:
-                    json_obj = json.loads(open(f'{imgdir}/{config[7:]}.json').read())
+                    with open(f'{imgdir}/{config[7:]}.json', 'rb') as file:
+                        json_data = file.read()
+                        json_obj = json.loads(json_data.decode('utf-8'))
                     json_obj.pop('history', None)
                     json_obj.pop('rootfs', None)
                 else:
@@ -202,7 +214,7 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
 
                 with open(f'{layerdir}/json', 'w') as file:
                     json.dump(json_obj, file)
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             logger.error(f'请求层失败: {e}')
             raise
 
@@ -213,6 +225,7 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
     repo_tag = f'{"/".join(imgparts[:-1])}/{img}' if imgparts[:-1] else img
     with open(f'{imgdir}/repositories', 'w') as file:
         json.dump({repo_tag: {tag: fake_layerid}}, file)
+
 
 def create_image_tar(imgdir, repo, img, arch):
     """将镜像打包为 tar 文件"""
