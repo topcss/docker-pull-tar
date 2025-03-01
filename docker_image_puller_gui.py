@@ -189,8 +189,13 @@ class DockerPullerGUI(QMainWindow):
     def create_progress_bars(self, layout):
         self.layer_progress_label = QLabel()
         self.layer_progress_bar = QProgressBar()
+        self.layer_progress_bar.setValue(0)  # 初始化进度条值为0
+        self.layer_progress_bar.setFormat("%p%")  # 设置进度条始终显示百分比
+
         self.overall_progress_label = QLabel()
         self.overall_progress_bar = QProgressBar()
+        self.overall_progress_bar.setValue(0)  # 初始化进度条值为0
+        self.overall_progress_bar.setFormat("%p%")  # 设置进度条始终显示百分比
 
         for widget in [
             self.layer_progress_label, self.layer_progress_bar,
@@ -212,10 +217,59 @@ class DockerPullerGUI(QMainWindow):
         tag = self.tag_entry.text().strip()
 
         if not image or not tag:
-            QMessageBox.critical(self,
-                {"zh": "错误", "en": "Error"}[self.language],
-                {"zh": "镜像名称和标签不能为空！", "en": "Image name and tag cannot be empty!"}[self.language]
-            )
+            # 创建 QMessageBox
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle({
+                                       "zh": "错误",
+                                       "en": "Error"
+                                   }[self.language])
+            msg_box.setText({
+                                "zh": "镜像名称和标签不能为空！",
+                                "en": "Image name and tag cannot be empty!"
+                            }[self.language])
+            msg_box.setIcon(QMessageBox.Icon.Critical)
+
+            # 根据主题模式设置 QMessageBox 的样式表
+            if self.theme_mode == "dark":
+                msg_box.setStyleSheet("""
+                    QMessageBox {
+                        background-color: #353535;
+                        color: white;
+                    }
+                    QMessageBox QLabel {
+                        color: white;
+                    }
+                    QMessageBox QPushButton {
+                        background-color: #535353; /* 灰色背景 */
+                        color: white; /* 白色文字 */
+                        border-radius: 5px; /* 圆润样式 */
+                        padding: 5px 10px; /* 内边距 */
+                    }
+                    QMessageBox QPushButton:hover {
+                        background-color: #636363; /* 鼠标悬停时的背景颜色 */
+                    }
+                """)
+            else:
+                msg_box.setStyleSheet("""
+                    QMessageBox {
+                        background-color: white;
+                        color: black;
+                    }
+                    QMessageBox QLabel {
+                        color: black;
+                    }
+                    QMessageBox QPushButton {
+                        background-color: #f0f0f0; /* 浅灰色背景 */
+                        color: black; /* 黑色文字 */
+                        border-radius: 5px; /* 圆润样式 */
+                        padding: 5px 10px; /* 内边距 */
+                    }
+                    QMessageBox QPushButton:hover {
+                        background-color: #e0e0e0; /* 鼠标悬停时的背景颜色 */
+                    }
+                """)
+
+            msg_box.exec()
             return
 
         stop_event.clear()
@@ -340,18 +394,21 @@ class DockerPullerGUI(QMainWindow):
     def show_settings_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle({
-            "zh": "设置",
-            "en": "Settings"
-        }[self.language])
+                                  "zh": "设置",
+                                  "en": "Settings"
+                              }[self.language])
 
-        # 应用当前主题模式到弹窗
-        dialog.setPalette(self.palette())
+        # 手动设置弹窗的背景色和字体颜色
+        if self.theme_mode == "dark":
+            dialog.setStyleSheet("background-color: #353535; color: white;")
+        else:
+            dialog.setStyleSheet("background-color: white; color: black;")
 
         # 语言设置
         lang_label = QLabel({
-            "zh": "语言设置：",
-            "en": "Language:"
-        }[self.language])
+                                "zh": "语言设置：",
+                                "en": "Language:"
+                            }[self.language])
 
         lang_combo = QComboBox()
         lang_combo.addItems(["中文", "English"])
@@ -359,24 +416,24 @@ class DockerPullerGUI(QMainWindow):
 
         # 主题设置
         theme_label = QLabel({
-            "zh": "主题模式：",
-            "en": "Theme:"
-        }[self.language])
+                                 "zh": "主题模式：",
+                                 "en": "Theme:"
+                             }[self.language])
 
         theme_combo = QComboBox()
         theme_combo.addItems(["亮色", "暗色"] if self.language == "zh" else ["Light", "Dark"])
         theme_combo.setCurrentText({
-            ("light", "zh"): "亮色",
-            ("dark", "zh"): "暗色",
-            ("light", "en"): "Light",
-            ("dark", "en"): "Dark"
-        }[(self.theme_mode, self.language)])
+                                       ("light", "zh"): "亮色",
+                                       ("dark", "zh"): "暗色",
+                                       ("light", "en"): "Light",
+                                       ("dark", "en"): "Dark"
+                                   }[(self.theme_mode, self.language)])
 
         # 应用按钮
         apply_btn = QPushButton({
-            "zh": "应用",
-            "en": "Apply"
-        }[self.language])
+                                    "zh": "应用",
+                                    "en": "Apply"
+                                }[self.language])
 
         layout = QVBoxLayout()
         layout.addWidget(lang_label)
@@ -394,6 +451,73 @@ class DockerPullerGUI(QMainWindow):
             dialog.close()
 
         apply_btn.clicked.connect(apply_settings)
+        dialog.exec()
+
+    def manage_registries(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle({
+                                  "zh": "管理仓库地址",
+                                  "en": "Manage Registries"
+                              }[self.language])
+
+        # 手动设置弹窗的背景色和字体颜色
+        if self.theme_mode == "dark":
+            dialog.setStyleSheet("background-color: #353535; color: white;")
+        else:
+            dialog.setStyleSheet("background-color: white; color: black;")
+
+        text_area = QTextEdit()
+        text_area.setFont(QFont("Microsoft YaHei", 12))
+        # 初始化文本区域内容为当前 registries.txt 文件中的内容
+        if os.path.exists("registries.txt"):
+            with open("registries.txt", "r", encoding="utf-8") as f:
+                text_area.setText(f.read().strip())
+        else:
+            text_area.setText("")
+
+        dialog_layout = QVBoxLayout()
+        dialog_layout.addWidget(text_area)
+
+        def save_and_close():
+            # 获取用户输入的仓库地址列表
+            registries = text_area.toPlainText().strip().split("\n")
+            valid_registries = []
+
+            # 验证每个仓库地址是否有效
+            for registry in registries:
+                registry = registry.strip()
+                if registry and self.is_valid_registry(registry):
+                    valid_registries.append(registry)
+                elif registry:
+                    QMessageBox.warning(self, {
+                        "zh": "无效的仓库地址",
+                        "en": "Invalid Registry"
+                    }[self.language], {
+                                            "zh": f"无效的仓库地址：{registry}\n请检查域名格式。",
+                                            "en": f"Invalid registry address: {registry}\nPlease check the domain format."
+                                        }[self.language])
+
+            # 更新 registries.txt 文件
+            with open("registries.txt", "w", encoding="utf-8") as f:
+                for registry in valid_registries:
+                    f.write(registry + "\n")
+
+            # 更新 QComboBox 的内容
+            self.registry_combobox.clear()
+            self.registry_combobox.addItem("registry.hub.docker.com")
+            self.registry_combobox.addItems(valid_registries)
+
+            dialog.close()
+
+        save_button = QPushButton({
+                                      "zh": "保存",
+                                      "en": "Save"
+                                  }[self.language])
+        save_button.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
+        save_button.clicked.connect(save_and_close)
+        dialog_layout.addWidget(save_button)
+
+        dialog.setLayout(dialog_layout)
         dialog.exec()
 
     def apply_button_style(self, button):
@@ -426,14 +550,14 @@ class DockerPullerGUI(QMainWindow):
         if self.theme_mode == "dark":
             palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
             palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
-            palette.setColor(QPalette.ColorRole.Base, QColor(25, 25, 25))
+            palette.setColor(QPalette.ColorRole.Base, QColor(51, 51, 51))  # 输入框背景色
             palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.white)
             palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
             palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
         else:
-            palette.setColor(QPalette.ColorRole.Window, QColor(255, 255, 255))  # 设置背景为白色
+            palette.setColor(QPalette.ColorRole.Window, QColor(255, 255, 255))  # 设置背景颜色
             palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.black)
-            palette.setColor(QPalette.ColorRole.Base, QColor(240, 240, 240))  # 设置输入框背景为浅灰色
+            palette.setColor(QPalette.ColorRole.Base, QColor(240, 240, 240))  # 设置输入框背景颜色
             palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.black)
             palette.setColor(QPalette.ColorRole.Button, QColor(240, 240, 240))
             palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.black)
@@ -449,6 +573,14 @@ class DockerPullerGUI(QMainWindow):
 
         # 更新消息框样式
         QApplication.instance().setPalette(palette)
+
+        # 显式设置输入框的背景色
+        input_widgets = [self.image_entry, self.tag_entry, self.registry_combobox, self.arch_combobox]
+        for widget in input_widgets:
+            if self.theme_mode == "dark":
+                widget.setStyleSheet("background-color: #333333; color: white;")
+            else:
+                widget.setStyleSheet("background-color: #f0f0f0; color: black;")
 
     def update_ui_text(self):
         translations = {
