@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 stop_event = threading.Event()
 
+
 def create_session():
     """创建带有重试和代理配置的请求会话"""
     session = requests.Session()
@@ -55,8 +56,9 @@ def create_session():
 
     return session
 
-def parse_image_input(image_input):
+def parse_image_input(args):
     """解析用户输入的镜像名称，支持私有仓库格式"""
+    image_input = args.image
     # 检查是否包含私有仓库地址
     if '/' in image_input and ('.' in image_input.split('/')[0] or ':' in image_input.split('/')[0]):
         # 私有仓库格式: harbor.abc.com/abc/nginx:1.26.0
@@ -93,8 +95,11 @@ def parse_image_input(image_input):
         
         # 组合成完整的仓库路径
         repository = f'{repo}/{img}'
-        
-        return 'registry-1.docker.io', repository, img, tag
+        if not args.custom_registry:
+            registry = 'registry-1.docker.io'
+        else:
+            registry = args.custom_registry
+        return registry, repository, img, tag
 
 def get_auth_head(session, auth_url, reg_service, repository, username=None, password=None):
     """获取认证头，支持用户名密码认证"""
@@ -287,7 +292,9 @@ def main():
     try:
         parser = argparse.ArgumentParser(description="Docker 镜像拉取工具")
         parser.add_argument("-i", "--image", required=False, help="Docker 镜像名称（例如：nginx:latest 或 harbor.abc.com/abc/nginx:1.26.0）")
-        parser.add_argument("-a", "--arch", help="架构,默认：amd64,可选：amd64, arm32v5, arm32v7, arm64v8, i386, mips64le, ppc64le, s390x")
+        parser.add_argument("-q", "--quiet", action="store_true", help="静默模式，减少交互")
+        parser.add_argument("-r", "--custom_registry", help="自定义仓库地址（例如：harbor.abc.com）")
+        parser.add_argument("-a", "--arch", help="架构,默认：amd64,常用：amd64, arm32v5, arm32v7, arm64v8, i386, mips64le, ppc64le, s390x")
         parser.add_argument("-u", "--username", help="Docker 仓库用户名")
         parser.add_argument("-p", "--password", help="Docker 仓库密码")
         parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}", help="显示版本信息")
@@ -307,13 +314,26 @@ def main():
             if not args.image:
                 logger.error("错误：镜像名称是必填项。")
                 return
-
-        # 解析镜像信息
-        registry, repository, img, tag = parse_image_input(args.image)
         
+        # 获取架构
+        if not args.arch and not args.quiet:
+            args.arch = input("请输入架构（常用: amd64, arm64v8, arm32v7, arm32v5, i386, mips64le, ppc64le, s390x，默认: amd64）：").strip() or 'amd64'
+        
+        # 获取自定义仓库地址
+        if not args.custom_registry and not args.quiet:
+            use_custom_registry = input("是否使用自定义仓库地址？(y/n, 默认: y): ").strip().lower() or 'y'
+            if use_custom_registry == 'y':
+                args.custom_registry = input("请输入自定义仓库地址: ").strip()
+        # 解析镜像信息
+        registry, repository, img, tag = parse_image_input(args)
+        
+        # 获取认证信息
+        if not args.username and not args.quiet:
+            args.username = input("请输入 Docker 仓库用户名: ").strip()
+        if not args.password and not args.quiet:
+            args.password = input("请输入 Docker 仓库密码: ").strip()
         session = create_session()
         auth_head = None
-
         try:
             url = f'https://{registry}/v2/'
             logger.debug(f"获取认证信息 CURL 命令: curl '{url}'")
@@ -348,36 +368,38 @@ def main():
             if archs:
                 logger.debug(f'当前可用架构：{", ".join(archs)}')
 
-                # 获取架构
-                if not args.arch:
-                    if len(archs) == 1:
-                        args.arch = archs[0]
-                        logger.info(f'自动选择唯一可用架构: {args.arch}')
-                    else:
-                        args.arch = input(f"请输入架构（可选: {', '.join(archs)}，默认: amd64）：").strip() or 'amd64'
+            if len(archs) == 1:
+                args.arch = archs[0]
+                logger.info(f'自动选择唯一可用架构: {args.arch}')
 
-                digest = select_manifest(manifests, args.arch)
-                if digest:
-                    url = f'https://{registry}/v2/{repository}/manifests/{digest}'
-                    headers = ' '.join([f"-H '{key}: {value}'" for key, value in auth_head.items()])
-                    curl_command = f"curl '{url}' {headers}"
-                    logger.debug(f'获取架构清单 CURL 命令: {curl_command}')
-                    manifest_resp = session.get(url, headers=auth_head, verify=False, timeout=30)
-                    manifest_resp.raise_for_status()
-                    resp_json = manifest_resp.json()
-                else:
-                    logger.error(f'在清单中找不到指定的架构 {args.arch}')
-                    return
-            else:
-                if not args.arch:
-                    args.arch = 'amd64'
-        else:
-            if not args.arch:
-                args.arch = 'amd64'
-                
-        if 'layers' not in resp_json:
-            logger.error('错误：清单中没有层')
-            return
+            # 获取架构
+            if not args.arch or args.arch not in archs:
+                args.arch = input(f"请输入架构（可选: {', '.join(archs)}，默认: amd64）：").strip() or 'amd64'
+
+            digest = select_manifest(manifests, args.arch)
+            if not digest:
+                logger.error(f'在清单中找不到指定的架构 {args.arch}')
+                return
+
+            # 构造请求
+            url = f'https://{registry}/v2/{repository}/manifests/{digest}'
+            headers = ' '.join([f"-H '{key}: {value}'" for key, value in auth_head.items()])
+            curl_command = f"curl '{url}' {headers}"
+            logger.debug(f'获取架构清单 CURL 命令: {curl_command}')
+
+            # 获取清单
+            manifest_resp = session.get(url, headers=auth_head, verify=False, timeout=30)
+            try:
+                manifest_resp.raise_for_status()
+                resp_json = manifest_resp.json()
+            except Exception as e:
+                logger.error(f'获取架构清单失败: {e}')
+                return
+
+            if 'layers' not in resp_json:
+                logger.error('错误：清单中没有层')
+                return
+
 
         logger.info(f'仓库地址：{registry}')
         logger.info(f'镜像：{repository}')
