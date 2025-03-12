@@ -294,7 +294,7 @@ def main():
         parser.add_argument("-i", "--image", required=False, help="Docker 镜像名称（例如：nginx:latest 或 harbor.abc.com/abc/nginx:1.26.0）")
         parser.add_argument("-q", "--quiet", action="store_true", help="静默模式，减少交互")
         parser.add_argument("-r", "--custom_registry", help="自定义仓库地址（例如：harbor.abc.com）")
-        parser.add_argument("-a", "--arch", help="架构,默认：amd64,常用：amd64, arm32v5, arm32v7, arm64v8, i386, mips64le, ppc64le, s390x")
+        parser.add_argument("-a", "--arch", help="架构,默认：amd64,常见：amd64, arm64v8等")
         parser.add_argument("-u", "--username", help="Docker 仓库用户名")
         parser.add_argument("-p", "--password", help="Docker 仓库密码")
         parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}", help="显示版本信息")
@@ -315,15 +315,15 @@ def main():
                 logger.error("错误：镜像名称是必填项。")
                 return
         
-        # 获取架构
-        if not args.arch and not args.quiet:
-            args.arch = input("请输入架构（常用: amd64, arm64v8, arm32v7, arm32v5, i386, mips64le, ppc64le, s390x，默认: amd64）：").strip() or 'amd64'
+        # # 获取架构
+        # if not args.arch and not args.quiet:
+        #     args.arch = input("请输入架构（常见: amd64, arm64v8等，默认: amd64）：").strip() or 'amd64'
         
         # 获取自定义仓库地址
         if not args.custom_registry and not args.quiet:
             use_custom_registry = input("是否使用自定义仓库地址？(y/n, 默认: y): ").strip().lower() or 'y'
             if use_custom_registry == 'y':
-                args.custom_registry = input("请输入自定义仓库地址: ").strip()
+                args.custom_registry = input("请输入自定义仓库地址: )").strip()
         # 解析镜像信息
         registry, repository, img, tag = parse_image_input(args)
         
