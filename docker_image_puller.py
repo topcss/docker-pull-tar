@@ -321,17 +321,19 @@ def main():
         
         # 获取自定义仓库地址
         if not args.custom_registry and not args.quiet:
-            use_custom_registry = input("是否使用自定义仓库地址？(y/n, 默认: y): ").strip().lower() or 'y'
-            if use_custom_registry == 'y':
-                args.custom_registry = input("请输入自定义仓库地址: )").strip()
+            # use_custom_registry = input("是否使用自定义仓库地址？(y/n, 默认: y): ").strip().lower() or 'y'
+            # if use_custom_registry == 'y':
+            #     args.custom_registry = input("请输入自定义仓库地址: )").strip()
+            args.custom_registry = input("请输入自定义仓库地址: （默认 dockerhub）").strip()
+
         # 解析镜像信息
         registry, repository, img, tag = parse_image_input(args)
         
         # 获取认证信息
         if not args.username and not args.quiet:
-            args.username = input("请输入 Docker 仓库用户名: ").strip()
+            args.username = input("请输入镜像仓库用户名: ").strip()
         if not args.password and not args.quiet:
-            args.password = input("请输入 Docker 仓库密码: ").strip()
+            args.password = input("请输入镜像仓库密码: ").strip()
         session = create_session()
         auth_head = None
         try:
