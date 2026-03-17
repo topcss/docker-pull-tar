@@ -667,6 +667,14 @@ def create_image_tar(imgdir: str, repository: str, tag: str, arch: str, output_d
         with tarfile.open(docker_tar, "w") as tar:
             tar.add(imgdir, arcname='/')
         logger.debug(f'Docker 镜像已拉取：{docker_tar}')
+        
+        try:
+            if os.path.exists(imgdir):
+                shutil.rmtree(imgdir)
+                logger.debug(f'已清理 layers 目录: {imgdir}')
+        except Exception as e:
+            logger.warning(f'清理 layers 目录失败: {e}')
+        
         return docker_tar
     except Exception as e:
         logger.error(f'打包镜像失败: {e}')
