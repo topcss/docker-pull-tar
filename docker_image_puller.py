@@ -108,6 +108,14 @@ class LayerProgress:
         self.current_chunk = current
         self.total_chunks = total
 
+    @staticmethod
+    def format_size(size: int) -> str:
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024:
+                return f"{size:.1f}{unit}"
+            size /= 1024
+        return f"{size:.1f}TB"
+
 
 class ProgressDisplay:
     def __init__(self, bar_width: int = 30):
