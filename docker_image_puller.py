@@ -209,7 +209,7 @@ def get_auth_head(
             access_token = resp.json()['token']
             auth_head = {
                 'Authorization': f'Bearer {access_token}',
-                'Accept': 'application/vnd.docker.distribution.manifest.v2+json'
+                'Accept': 'application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json'
             }
 
             return auth_head
