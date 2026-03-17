@@ -32,7 +32,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 urllib3.disable_warnings()
 
-VERSION = "v1.5.0"
+VERSION = "v1.6.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -366,8 +366,11 @@ def download_file_with_progress(
     expected_digest: Optional[str] = None,
     max_retries: int = 10,
     stats: Optional[DownloadStats] = None,
-    position: int = 0
+    position: int = 0,
+    chunk_size: int = 10 * 1024 * 1024
 ) -> bool:
+    CHUNK_THRESHOLD = 50 * 1024 * 1024
+    
     for attempt in range(max_retries):
         if stop_event.is_set():
             logger.info('下载被用户取消')
@@ -396,6 +399,13 @@ def download_file_with_progress(
                     total_size = int(content_range.split('/')[1])
                 else:
                     total_size = int(resp.headers.get('content-length', 0)) + resume_pos
+
+                if total_size - resume_pos > CHUNK_THRESHOLD and resume_pos == 0:
+                    logger.info(f'{desc}: 大文件 ({total_size / 1024 / 1024:.1f} MB)，启用分片下载')
+                    return download_file_in_chunks(
+                        session, url, headers, save_path, desc, 
+                        total_size, expected_digest, max_retries, stats, position, chunk_size
+                    )
 
                 mode = 'ab' if resume_pos > 0 else 'wb'
                 sha256_hash = hashlib.sha256() if expected_digest else None
@@ -499,6 +509,111 @@ def download_file_with_progress(
             return False
 
     return False
+
+
+def download_file_in_chunks(
+    session: requests.Session,
+    url: str,
+    headers: Dict[str, str],
+    save_path: str,
+    desc: str,
+    total_size: int,
+    expected_digest: Optional[str] = None,
+    max_retries: int = 10,
+    stats: Optional[DownloadStats] = None,
+    position: int = 0,
+    chunk_size: int = 10 * 1024 * 1024
+) -> bool:
+    num_chunks = (total_size + chunk_size - 1) // chunk_size
+    temp_dir = save_path + '.chunks'
+    
+    try:
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        chunk_files = []
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = min((i + 1) * chunk_size, total_size)
+            chunk_file = os.path.join(temp_dir, f'chunk_{i:04d}')
+            chunk_files.append((start, end, chunk_file))
+        
+        completed_chunks = []
+        for i, (start, end, chunk_file) in enumerate(chunk_files):
+            if stop_event.is_set():
+                logger.info('下载被用户取消')
+                return False
+            
+            if os.path.exists(chunk_file) and os.path.getsize(chunk_file) == end - start:
+                logger.debug(f'{desc}: 分片 {i+1}/{num_chunks} 已存在，跳过')
+                completed_chunks.append(i)
+                continue
+            
+            chunk_headers = headers.copy()
+            chunk_headers['Range'] = f'bytes={start}-{end-1}'
+            
+            for attempt in range(max_retries):
+                if stop_event.is_set():
+                    return False
+                
+                try:
+                    logger.debug(f'{desc}: 下载分片 {i+1}/{num_chunks} ({start}-{end})')
+                    with session.get(url, headers=chunk_headers, verify=False, timeout=120, stream=True) as resp:
+                        resp.raise_for_status()
+                        
+                        with open(chunk_file, 'wb') as f:
+                            for data in resp.iter_content(chunk_size=65536):
+                                if stop_event.is_set():
+                                    return False
+                                if data:
+                                    f.write(data)
+                        
+                        completed_chunks.append(i)
+                        break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait_time = min(2 ** attempt, 60)
+                        logger.warning(f'{desc}: 分片 {i+1} 下载失败，{wait_time}秒后重试: {e}')
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f'❌ {desc}: 分片 {i+1} 下载失败')
+                        raise
+        
+        logger.info(f'{desc}: 合并 {num_chunks} 个分片...')
+        sha256_hash = hashlib.sha256() if expected_digest else None
+        
+        with open(save_path, 'wb') as outfile:
+            for i, (_, _, chunk_file) in enumerate(chunk_files):
+                if stop_event.is_set():
+                    return False
+                
+                with open(chunk_file, 'rb') as infile:
+                    while True:
+                        data = infile.read(65536)
+                        if not data:
+                            break
+                        outfile.write(data)
+                        if sha256_hash:
+                            sha256_hash.update(data)
+        
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        if expected_digest and sha256_hash:
+            actual_digest = f'sha256:{sha256_hash.hexdigest()}'
+            if actual_digest != expected_digest:
+                logger.error(f'❌ {desc} 校验失败！')
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+                return False
+            logger.info(f'✅ {desc} 校验成功')
+        
+        logger.info(f'✅ {desc} 分片下载完成')
+        return True
+        
+    except Exception as e:
+        logger.error(f'❌ {desc} 分片下载失败: {e}')
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return False
 
 
 def download_layers(
