@@ -23,7 +23,7 @@ VSVersionInfo(
             StringStruct('LegalCopyright', 'MIT License | GitHub: https://github.com/topcss/docker-pull-tar'),
             StringStruct('OriginalFilename', 'DockerPull.exe'),
             StringStruct('ProductName', 'DockerPull'),
-            StringStruct('ProductVersion', '1.6.1.0')
+            StringStruct('ProductVersion', '1.8.0.0')
           ]
         )
       ]

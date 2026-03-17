@@ -31,7 +31,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 urllib3.disable_warnings()
 
-VERSION = "v1.7.0"
+VERSION = "v1.8.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,14 +42,24 @@ logger = logging.getLogger(__name__)
 
 stop_event = threading.Event()
 progress_lock = threading.Lock()
+original_sigint_handler = None
 
 
 def signal_handler(signum, frame):
-    logger.info('\n⚠️ 收到中断信号，正在保存进度...')
+    global stop_event
+    if stop_event.is_set():
+        print('\n⚠️ 强制退出...')
+        if original_sigint_handler:
+            signal.signal(signal.SIGINT, original_sigint_handler)
+            raise KeyboardInterrupt
+        sys.exit(1)
+    
     stop_event.set()
+    print('\n⚠️ 收到中断信号，正在保存进度并优雅退出...')
+    print('💡 再次按 Ctrl+C 强制退出')
 
 
-signal.signal(signal.SIGINT, signal_handler)
+original_sigint_handler = signal.signal(signal.SIGINT, signal_handler)
 
 
 @dataclass
@@ -99,6 +109,8 @@ class LayerProgress:
         self.chunk_count = 0
         self.total_chunks = 0
         self.current_chunk = 0
+        self.retry_count = 0
+        self.is_resume = False
 
     def update(self, downloaded: int, chunk_info: str = ''):
         self.downloaded_size = downloaded
@@ -199,7 +211,15 @@ class ProgressDisplay:
         
         status_icon = "✅" if layer.status == 'completed' else "⬇️"
         
-        return f"  {status_icon} {layer.name[:12]:<12} |{bar}| {progress*100:5.1f}% {size_str:>15}{chunk_info} ({layer.index}/{layer.total_layers})"
+        retry_info = ""
+        if layer.retry_count > 0:
+            retry_info = f" 🔄{layer.retry_count}"
+        
+        resume_info = ""
+        if layer.is_resume:
+            resume_info = " 📎"
+        
+        return f"  {status_icon} ({layer.index}/{layer.total_layers}) {layer.name[:12]:<12} |{bar}| {progress*100:5.1f}% {size_str:>15}{chunk_info}{retry_info}{resume_info}"
 
     def print_initial(self):
         with progress_lock:
