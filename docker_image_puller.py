@@ -32,7 +32,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 urllib3.disable_warnings()
 
-VERSION = "v1.4.0"
+VERSION = "v1.5.0"
 
 logging.basicConfig(
     level=logging.INFO,
