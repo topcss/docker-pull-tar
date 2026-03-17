@@ -6,6 +6,11 @@ import hashlib
 import shutil
 import threading
 import time
+import warnings
+
+warnings.filterwarnings('ignore', message='urllib3.*doesn\'t match a supported version')
+warnings.filterwarnings('ignore', category=UserWarning, module='requests')
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
