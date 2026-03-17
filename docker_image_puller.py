@@ -828,14 +828,20 @@ def main():
                     config_json = config_resp.json()
                     actual_arch = config_json.get('architecture', 'unknown')
                     actual_os = config_json.get('os', 'unknown')
-                    logger.info(f'📋 镜像架构信息: {actual_os}/{actual_arch}')
+                    logger.info(f'📋 镜像实际架构: {actual_os}/{actual_arch}')
                     
                     if actual_arch != args.arch:
-                        logger.warning(f'⚠️  当前镜像架构为 {actual_arch}，与请求的 {args.arch} 不匹配')
+                        logger.warning(f'⚠️  镜像架构为 {actual_arch}，与请求的 {args.arch} 不匹配')
                         if not args.quiet:
                             use_actual = input(f'是否使用镜像实际架构 {actual_arch}？(y/n, 默认: y): ').strip().lower() or 'y'
                             if use_actual == 'y':
                                 args.arch = actual_arch
+                    else:
+                        if not args.quiet:
+                            confirm = input(f'确认下载 {actual_os}/{actual_arch} 架构的镜像？(y/n, 默认: y): ').strip().lower() or 'y'
+                            if confirm != 'y':
+                                logger.info('用户取消下载')
+                                return
                 except Exception as e:
                     logger.warning(f'获取镜像配置失败: {e}')
 
