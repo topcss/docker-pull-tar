@@ -32,7 +32,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 urllib3.disable_warnings()
 
-VERSION = "v1.3.0"
+VERSION = "v1.4.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,8 +42,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 stop_event = threading.Event()
-
-CACHE_DIR = Path.home() / '.docker-pull-cache'
+download_lock = threading.Lock()
+progress_positions: Dict[str, int] = {}
+current_position = 0
 
 
 def signal_handler(signum, frame):
@@ -131,16 +132,17 @@ class SessionManager:
         return session
 
 
-def get_cache_dir(repository: str, tag: str, arch: str) -> Path:
+def get_output_dir(repository: str, tag: str, arch: str, output_path: Optional[str] = None) -> Path:
     safe_repo = repository.replace("/", "_").replace(":", "_")
-    cache_path = CACHE_DIR / f"{safe_repo}_{tag}_{arch}"
-    cache_path.mkdir(parents=True, exist_ok=True)
-    return cache_path
+    dir_name = f"{safe_repo}_{tag}_{arch}"
 
+    if output_path:
+        output_dir = Path(output_path) / dir_name
+    else:
+        output_dir = Path.cwd() / dir_name
 
-def get_progress_file(repository: str, tag: str, arch: str) -> Path:
-    cache_path = get_cache_dir(repository, tag, arch)
-    return cache_path / 'progress.json'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
 
 
 def parse_image_input(image_input: str, custom_registry: Optional[str] = None) -> ImageInfo:
@@ -260,12 +262,12 @@ def select_manifest(manifests: List[Dict], arch: str) -> Optional[str]:
 
 
 class DownloadProgressManager:
-    def __init__(self, repository: str, tag: str, arch: str):
+    def __init__(self, output_dir: Path, repository: str, tag: str, arch: str):
+        self.output_dir = output_dir
         self.repository = repository
         self.tag = tag
         self.arch = arch
-        self.cache_dir = get_cache_dir(repository, tag, arch)
-        self.progress_file = get_progress_file(repository, tag, arch)
+        self.progress_file = output_dir / 'progress.json'
         self.progress_data = self.load_progress()
 
     def load_progress(self) -> Dict[str, Any]:
@@ -346,6 +348,15 @@ class DownloadProgressManager:
                 logger.error(f'清除进度文件失败: {e}')
 
 
+def get_progress_position(desc: str) -> int:
+    global current_position
+    with download_lock:
+        if desc not in progress_positions:
+            progress_positions[desc] = current_position
+            current_position += 1
+        return progress_positions[desc]
+
+
 def download_file_with_progress(
     session: requests.Session,
     url: str,
@@ -354,7 +365,8 @@ def download_file_with_progress(
     desc: str,
     expected_digest: Optional[str] = None,
     max_retries: int = 10,
-    stats: Optional[DownloadStats] = None
+    stats: Optional[DownloadStats] = None,
+    position: int = 0
 ) -> bool:
     for attempt in range(max_retries):
         if stop_event.is_set():
@@ -404,7 +416,7 @@ def download_file_with_progress(
 
                 with open(save_path, mode) as file, tqdm(
                         total=total_size, initial=resume_pos, unit='B', unit_scale=True,
-                        desc=desc, position=0, leave=True
+                        desc=desc, position=position, leave=False
                 ) as pbar:
                     downloaded_size = resume_pos
                     last_update_time = time.time()
@@ -500,11 +512,16 @@ def download_layers(
     imgparts: List[str],
     img: str,
     tag: str,
-    arch: str
+    arch: str,
+    output_dir: Path
 ):
+    global current_position, progress_positions
+    current_position = 0
+    progress_positions = {}
+
     os.makedirs(imgdir, exist_ok=True)
 
-    progress_manager = DownloadProgressManager(repository, tag, arch)
+    progress_manager = DownloadProgressManager(output_dir, repository, tag, arch)
     stats = DownloadStats()
 
     try:
@@ -521,7 +538,7 @@ def download_layers(
 
             if not download_file_with_progress(
                 session, config_url, auth_head, config_path, "Config",
-                expected_digest=config_digest, stats=stats
+                expected_digest=config_digest, stats=stats, position=0
             ):
                 progress_manager.update_config_status('failed')
                 raise Exception(f'Config JSON {config_filename} 下载失败')
@@ -559,15 +576,19 @@ def download_layers(
     if skipped_count > 0:
         logger.info(f'📦 跳过 {skipped_count} 个已下载的层，还需下载 {len(layers_to_download)} 个层')
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    num_workers = min(len(layers_to_download), 4) if layers_to_download else 1
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = {}
         try:
-            for ublob, fake_layerid, layerdir, save_path in layers_to_download:
+            for idx, (ublob, fake_layerid, layerdir, save_path) in enumerate(layers_to_download):
                 if stop_event.is_set():
                     raise KeyboardInterrupt
 
                 url = f'https://{registry}/v2/{repository}/blobs/{ublob}'
                 progress_manager.update_layer_status(ublob, 'downloading')
+
+                position = idx + 1
 
                 futures[executor.submit(
                     download_file_with_progress,
@@ -577,7 +598,8 @@ def download_layers(
                     save_path,
                     ublob[:12],
                     expected_digest=ublob,
-                    stats=stats
+                    stats=stats,
+                    position=position
                 )] = (ublob, save_path)
 
             for future in as_completed(futures):
@@ -598,6 +620,8 @@ def download_layers(
             stop_event.set()
             executor.shutdown(wait=False)
             raise
+
+    print()
 
     for fake_layerid in layer_json_map.keys():
         if stop_event.is_set():
@@ -636,9 +660,9 @@ def download_layers(
     progress_manager.clear_progress()
 
 
-def create_image_tar(imgdir: str, repository: str, tag: str, arch: str) -> str:
+def create_image_tar(imgdir: str, repository: str, tag: str, arch: str, output_dir: Path) -> str:
     safe_repo = repository.replace("/", "_")
-    docker_tar = f'{safe_repo}_{tag}_{arch}.tar'
+    docker_tar = str(output_dir / f'{safe_repo}_{tag}_{arch}.tar')
     try:
         with tarfile.open(docker_tar, "w") as tar:
             tar.add(imgdir, arcname='/')
@@ -660,62 +684,6 @@ def cleanup_tmp_dir():
         logger.error(f'清理临时目录失败: {e}')
 
 
-def list_cached_images():
-    if not CACHE_DIR.exists():
-        logger.info('📁 缓存目录不存在')
-        return
-
-    logger.info(f'📁 缓存目录: {CACHE_DIR}')
-    logger.info('=' * 60)
-
-    total_size = 0
-    count = 0
-
-    for item in CACHE_DIR.iterdir():
-        if item.is_dir():
-            progress_file = item / 'progress.json'
-            if progress_file.exists():
-                try:
-                    with open(progress_file, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    metadata = data.get('metadata', {})
-                    layers = data.get('layers', {})
-
-                    completed = sum(1 for v in layers.values() if v.get('status') == 'completed')
-                    total = len(layers)
-
-                    dir_size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
-                    total_size += dir_size
-
-                    status = '✅ 完成' if completed == total and total > 0 else f'⏳ {completed}/{total}'
-                    logger.info(f'{item.name}: {status} ({dir_size / 1024 / 1024:.1f} MB)')
-                    logger.info(f'   镜像: {metadata.get("repository", "N/A")}:{metadata.get("tag", "N/A")}')
-                    logger.info(f'   架构: {metadata.get("arch", "N/A")}')
-                    logger.info('')
-                    count += 1
-                except Exception as e:
-                    logger.warning(f'读取缓存失败: {item.name} - {e}')
-
-    logger.info('=' * 60)
-    logger.info(f'共 {count} 个缓存，总大小: {total_size / 1024 / 1024:.1f} MB')
-
-
-def clear_cache(repository: Optional[str] = None):
-    if not CACHE_DIR.exists():
-        logger.info('📁 缓存目录不存在')
-        return
-
-    if repository:
-        safe_repo = repository.replace("/", "_").replace(":", "_")
-        for item in CACHE_DIR.iterdir():
-            if item.is_dir() and item.name.startswith(safe_repo):
-                shutil.rmtree(item)
-                logger.info(f'✅ 已清除缓存: {item.name}')
-    else:
-        shutil.rmtree(CACHE_DIR)
-        logger.info(f'✅ 已清除所有缓存')
-
-
 def main():
     try:
         parser = argparse.ArgumentParser(
@@ -725,9 +693,7 @@ def main():
 示例:
   %(prog)s -i nginx:latest
   %(prog)s -i harbor.example.com/library/nginx:1.26.0 -u admin -p password
-  %(prog)s -i alpine:latest -a arm64v8
-  %(prog)s --list-cache
-  %(prog)s --clear-cache
+  %(prog)s -i alpine:latest -a arm64v8 -o ./downloads
             """
         )
         parser.add_argument("-i", "--image", required=False,
@@ -737,10 +703,9 @@ def main():
         parser.add_argument("-a", "--arch", default="amd64", help="架构,默认：amd64,常见：amd64, arm64v8等")
         parser.add_argument("-u", "--username", help="Docker 仓库用户名")
         parser.add_argument("-p", "--password", help="Docker 仓库密码")
+        parser.add_argument("-o", "--output", help="输出目录，默认为当前目录下的镜像名_tag_arch目录")
         parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}", help="显示版本信息")
         parser.add_argument("--debug", action="store_true", help="启用调试模式，打印请求 URL 和连接状态")
-        parser.add_argument("--list-cache", action="store_true", help="列出缓存的镜像")
-        parser.add_argument("--clear-cache", action="store_true", help="清除所有缓存")
         parser.add_argument("--workers", type=int, default=4, help="并发下载线程数，默认4")
 
         logger.info(f'🚀 Docker 镜像拉取工具 {VERSION}')
@@ -749,14 +714,6 @@ def main():
 
         if args.debug:
             logger.setLevel(logging.DEBUG)
-
-        if args.list_cache:
-            list_cached_images()
-            return
-
-        if args.clear_cache:
-            clear_cache()
-            return
 
         if not args.image:
             args.image = input("请输入 Docker 镜像名称（例如：nginx:latest 或 harbor.abc.com/abc/nginx:1.26.0）：").strip()
@@ -822,14 +779,20 @@ def main():
             ]
 
             if archs:
-                logger.debug(f'当前可用架构：{", ".join(archs)}')
+                logger.info(f'📋 当前可用架构：{", ".join(archs)}')
 
             if len(archs) == 1:
                 args.arch = archs[0]
-                logger.info(f'自动选择唯一可用架构: {args.arch}')
+                logger.info(f'✅ 自动选择唯一可用架构: {args.arch}')
+            elif not args.quiet:
+                default_arch = args.arch if args.arch in archs else 'amd64'
+                user_arch = input(f"请输入架构（可选: {', '.join(archs)}，默认: {default_arch}）：").strip()
+                args.arch = user_arch if user_arch else default_arch
 
-            if not args.arch or args.arch not in archs:
-                args.arch = input(f"请输入架构（可选: {', '.join(archs)}，默认: amd64）：").strip() or 'amd64'
+            if args.arch not in archs:
+                logger.error(f'在清单中找不到指定的架构 {args.arch}')
+                logger.info(f'可用架构: {", ".join(archs)}')
+                return
 
             digest = select_manifest(manifests, args.arch)
             if not digest:
@@ -865,10 +828,10 @@ def main():
         logger.info(f'📦 标签：{image_info.tag}')
         logger.info(f'📦 架构：{args.arch}')
 
-        cache_dir = get_cache_dir(image_info.repository, image_info.tag, args.arch)
-        imgdir = str(cache_dir / 'layers')
+        output_dir = get_output_dir(image_info.repository, image_info.tag, args.arch, args.output)
+        imgdir = str(output_dir / 'layers')
         os.makedirs(imgdir, exist_ok=True)
-        logger.info(f'📁 缓存目录：{cache_dir}')
+        logger.info(f'📁 输出目录：{output_dir}')
         logger.info('📥 开始下载...')
 
         if image_info.registry == 'registry-1.docker.io' and image_info.repository.startswith('library/'):
@@ -879,10 +842,11 @@ def main():
         download_layers(
             session, image_info.registry, image_info.repository,
             resp_json['layers'], auth_head, imgdir, resp_json,
-            imgparts, image_info.image_name, image_info.tag, args.arch
+            imgparts, image_info.image_name, image_info.tag, args.arch,
+            output_dir
         )
 
-        output_file = create_image_tar(imgdir, image_info.repository, image_info.tag, args.arch)
+        output_file = create_image_tar(imgdir, image_info.repository, image_info.tag, args.arch, output_dir)
         logger.info(f'✅ 镜像已保存为: {output_file}')
         logger.info(f'💡 导入命令: docker load -i {output_file}')
         if image_info.registry not in ("registry-1.docker.io", "docker.io"):
