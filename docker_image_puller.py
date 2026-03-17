@@ -219,7 +219,11 @@ class ProgressDisplay:
         if layer.is_resume:
             resume_info = " 📎"
         
-        return f"  {status_icon} ({layer.index}/{layer.total_layers}) {layer.name[:12]:<12} |{bar}| {progress*100:5.1f}% {size_str:>15}{chunk_info}{retry_info}{resume_info}"
+        total_layers_str = str(layer.total_layers)
+        index_str = str(layer.index).rjust(len(total_layers_str))
+        layer_info = f"({index_str}/{total_layers_str})"
+        
+        return f"  {status_icon} {layer_info} {layer.name:<12} |{bar}| {progress*100:5.1f}% {size_str:>15}{chunk_info}{retry_info}{resume_info}"
 
     def print_initial(self):
         with progress_lock:
