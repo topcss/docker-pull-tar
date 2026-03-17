@@ -16,71 +16,133 @@ import argparse
 import logging
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# Set default encoding to UTF-8
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List, Tuple, Any
+from pathlib import Path
 import io
+import signal
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# 禁用 SSL 警告
 urllib3.disable_warnings()
 
-# 版本号
-VERSION = "v1.2.0"
+VERSION = "v1.3.0"
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', encoding='utf-8')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s: %(message)s',
+    encoding='utf-8'
+)
 logger = logging.getLogger(__name__)
 
 stop_event = threading.Event()
 
-
-def create_session():
-    """创建带有重试和代理配置的请求会话"""
-    session = requests.Session()
-
-    # 增强重试策略：更多重试次数，更长超时
-    retry_strategy = Retry(
-        total=5,  # 增加重试次数
-        backoff_factor=2,  # 指数退避：2, 4, 8, 16, 32秒
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "HEAD", "OPTIONS"]
-    )
-
-    # 设置HTTPAdapter，更长超时
-    adapter = HTTPAdapter(
-        max_retries=retry_strategy,
-        pool_connections=10,  # 连接池大小
-        pool_maxsize=20,  # 最大连接数
-        pool_block=False
-    )
-
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-
-    # 设置默认超时
-    session.timeout = (30, 300)  # (连接超时, 读取超时)
-
-    # 设置代理
-    session.proxies = {
-        'http': os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy'),
-        'https': os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
-    }
-    if session.proxies.get('http') or session.proxies.get('https'):
-        logger.info('使用代理设置从环境变量')
-
-    return session
+CACHE_DIR = Path.home() / '.docker-pull-cache'
 
 
-def parse_image_input(args):
-    """解析用户输入的镜像名称，支持私有仓库格式"""
-    image_input = args.image
-    # 检查是否包含私有仓库地址
+def signal_handler(signum, frame):
+    logger.info('\n⚠️ 收到中断信号，正在保存进度...')
+    stop_event.set()
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+
+@dataclass
+class ImageInfo:
+    registry: str
+    repository: str
+    image_name: str
+    tag: str
+
+
+@dataclass
+class DownloadStats:
+    total_size: int = 0
+    downloaded_size: int = 0
+    start_time: float = 0.0
+    speeds: List[float] = field(default_factory=list)
+
+    def get_avg_speed(self) -> float:
+        if not self.speeds:
+            return 0.0
+        return sum(self.speeds[-10:]) / len(self.speeds[-10:])
+
+    def format_size(self, size: int) -> str:
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024:
+                return f"{size:.2f} {unit}"
+            size /= 1024
+        return f"{size:.2f} TB"
+
+    def format_time(self, seconds: float) -> str:
+        if seconds < 60:
+            return f"{int(seconds)}秒"
+        elif seconds < 3600:
+            return f"{int(seconds // 60)}分{int(seconds % 60)}秒"
+        else:
+            return f"{int(seconds // 3600)}小时{int((seconds % 3600) // 60)}分"
+
+
+class SessionManager:
+    _instance: Optional[requests.Session] = None
+
+    @classmethod
+    def get_session(cls) -> requests.Session:
+        if cls._instance is None:
+            cls._instance = cls._create_session()
+        return cls._instance
+
+    @classmethod
+    def _create_session(cls) -> requests.Session:
+        session = requests.Session()
+
+        retry_strategy = Retry(
+            total=10,
+            backoff_factor=3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "HEAD", "OPTIONS"]
+        )
+
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=20,
+            pool_maxsize=50,
+            pool_block=False
+        )
+
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        session.timeout = (60, 600)
+
+        session.proxies = {
+            'http': os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy'),
+            'https': os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
+        }
+        if session.proxies.get('http') or session.proxies.get('https'):
+            logger.info('🌐 使用代理设置从环境变量')
+
+        return session
+
+
+def get_cache_dir(repository: str, tag: str, arch: str) -> Path:
+    safe_repo = repository.replace("/", "_").replace(":", "_")
+    cache_path = CACHE_DIR / f"{safe_repo}_{tag}_{arch}"
+    cache_path.mkdir(parents=True, exist_ok=True)
+    return cache_path
+
+
+def get_progress_file(repository: str, tag: str, arch: str) -> Path:
+    cache_path = get_cache_dir(repository, tag, arch)
+    return cache_path / 'progress.json'
+
+
+def parse_image_input(image_input: str, custom_registry: Optional[str] = None) -> ImageInfo:
     if '/' in image_input and ('.' in image_input.split('/')[0] or ':' in image_input.split('/')[0]):
-        # 私有仓库格式: harbor.abc.com/abc/nginx:1.26.0
         registry, remainder = image_input.split('/', 1)
         parts = remainder.split('/')
+
         if len(parts) == 1:
             repo = ''
             img_tag = parts[0]
@@ -88,16 +150,12 @@ def parse_image_input(args):
             repo = '/'.join(parts[:-1])
             img_tag = parts[-1]
 
-        # 解析镜像名和标签
         img, *tag_parts = img_tag.split(':')
         tag = tag_parts[0] if tag_parts else 'latest'
-
-        # 组合成完整的仓库路径
         repository = remainder.split(':')[0]
 
-        return registry, repository, img, tag
+        return ImageInfo(registry, repository, img, tag)
     else:
-        # 标准Docker Hub格式
         parts = image_input.split('/')
         if len(parts) == 1:
             repo = 'library'
@@ -106,107 +164,111 @@ def parse_image_input(args):
             repo = '/'.join(parts[:-1])
             img_tag = parts[-1]
 
-        # 解析镜像名和标签
         img, *tag_parts = img_tag.split(':')
         tag = tag_parts[0] if tag_parts else 'latest'
-
-        # 组合成完整的仓库路径
         repository = f'{repo}/{img}'
-        if not args.custom_registry:
+
+        if not custom_registry:
             registry = 'registry-1.docker.io'
         else:
-            registry = args.custom_registry
-        return registry, repository, img, tag
+            registry = custom_registry
+
+        return ImageInfo(registry, repository, img, tag)
 
 
-def get_auth_head(session, auth_url, reg_service, repository, username=None, password=None):
-    """获取认证头，支持用户名密码认证"""
-    try:
-        url = f'{auth_url}?service={reg_service}&scope=repository:{repository}:pull'
+def get_auth_head(
+    session: requests.Session,
+    auth_url: str,
+    reg_service: str,
+    repository: str,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    max_retries: int = 3
+) -> Dict[str, str]:
+    for attempt in range(max_retries):
+        try:
+            url = f'{auth_url}?service={reg_service}&scope=repository:{repository}:pull'
 
-        headers = {}
-        # 如果提供了用户名和密码，添加到请求头
-        if username and password:
-            auth_string = f"{username}:{password}"
-            encoded_auth = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
-            headers['Authorization'] = f'Basic {encoded_auth}'
+            headers = {}
+            if username and password:
+                auth_string = f"{username}:{password}"
+                encoded_auth = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
+                headers['Authorization'] = f'Basic {encoded_auth}'
 
-        # 打印 curl 命令
-        logger.debug(f"获取认证头 CURL 命令: curl '{url}'")
+            logger.debug(f"获取认证头: {url}")
 
-        resp = session.get(url, headers=headers, verify=False, timeout=30)
-        resp.raise_for_status()
-        access_token = resp.json()['token']
-        auth_head = {'Authorization': f'Bearer {access_token}',
-                     'Accept': 'application/vnd.docker.distribution.manifest.v2+json'}
+            resp = session.get(url, headers=headers, verify=False, timeout=60)
+            resp.raise_for_status()
+            access_token = resp.json()['token']
+            auth_head = {
+                'Authorization': f'Bearer {access_token}',
+                'Accept': 'application/vnd.docker.distribution.manifest.v2+json'
+            }
 
-        return auth_head
-    except requests.exceptions.RequestException as e:
-        logger.error(f'请求认证失败: {e}')
-        raise
-
-
-def fetch_manifest(session, registry, repository, tag, auth_head):
-    """获取镜像清单"""
-    try:
-        url = f'https://{registry}/v2/{repository}/manifests/{tag}'
-        # 打印 curl 命令
-        headers = ' '.join([f"-H '{key}: {value}'" for key, value in auth_head.items()])
-        curl_command = f"curl '{url}' {headers}"
-        logger.debug(f'获取镜像清单 CURL 命令: {curl_command}')
-        resp = session.get(url, headers=auth_head, verify=False, timeout=30)
-        if resp.status_code == 401:
-            logger.info('需要认证。')
-            return resp, 401
-        resp.raise_for_status()
-        return resp, 200
-    except requests.exceptions.RequestException as e:
-        logger.error(f'请求清单失败: {e}')
-        raise
+            return auth_head
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f'认证请求失败，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}')
+                time.sleep(wait_time)
+            else:
+                logger.error(f'请求认证失败: {e}')
+                raise
 
 
-def select_manifest(manifests, arch):
-    """选择适合指定架构的清单"""
-    selected_manifest = None
+def fetch_manifest(
+    session: requests.Session,
+    registry: str,
+    repository: str,
+    tag: str,
+    auth_head: Dict[str, str],
+    max_retries: int = 3
+) -> Tuple[requests.Response, int]:
+    for attempt in range(max_retries):
+        try:
+            url = f'https://{registry}/v2/{repository}/manifests/{tag}'
+            logger.debug(f'获取镜像清单: {url}')
+
+            resp = session.get(url, headers=auth_head, verify=False, timeout=60)
+            if resp.status_code == 401:
+                logger.info('需要认证。')
+                return resp, 401
+            resp.raise_for_status()
+            return resp, 200
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f'清单请求失败，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}')
+                time.sleep(wait_time)
+            else:
+                logger.error(f'请求清单失败: {e}')
+                raise
+
+
+def select_manifest(manifests: List[Dict], arch: str) -> Optional[str]:
     for m in manifests:
-        if (m.get('annotations', {}).get('com.docker.official-images.bashbrew.arch') == arch or \
+        if (m.get('annotations', {}).get('com.docker.official-images.bashbrew.arch') == arch or
             m.get('platform', {}).get('architecture') == arch) and \
                 m.get('platform', {}).get('os') == 'linux':
-            selected_manifest = m.get('digest')
-            break
-    return selected_manifest
+            return m.get('digest')
+    return None
 
 
 class DownloadProgressManager:
-    """下载进度管理器，支持进度持久化"""
-
-    def __init__(self, repository, tag, arch):
-        """
-        初始化进度管理器
-
-        Args:
-            repository: 镜像仓库名（如：library/alpine）
-            tag: 镜像标签（如：latest）
-            arch: 架构（如：amd64）
-        """
+    def __init__(self, repository: str, tag: str, arch: str):
         self.repository = repository
         self.tag = tag
         self.arch = arch
-
-        # 生成唯一的进度文件名
-        safe_repo = repository.replace("/", "_").replace(":", "_")
-        self.progress_file = f'.download_progress_{safe_repo}_{tag}_{arch}.json'
-
+        self.cache_dir = get_cache_dir(repository, tag, arch)
+        self.progress_file = get_progress_file(repository, tag, arch)
         self.progress_data = self.load_progress()
 
-    def load_progress(self):
-        """加载下载进度，并验证镜像信息"""
-        if os.path.exists(self.progress_file):
+    def load_progress(self) -> Dict[str, Any]:
+        if self.progress_file.exists():
             try:
                 with open(self.progress_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
 
-                    # 验证镜像信息是否匹配
                     metadata = data.get('metadata', {})
                     if (metadata.get('repository') == self.repository and
                             metadata.get('tag') == self.tag and
@@ -216,9 +278,6 @@ class DownloadProgressManager:
                         return data
                     else:
                         logger.warning(f'进度文件镜像信息不匹配，将创建新的进度')
-                        logger.debug(
-                            f'文件中: {metadata}, 当前: {{repository: {self.repository}, tag: {self.tag}, arch: {self.arch}}}')
-                        # 镜像信息不匹配，返回新的进度数据
                         return self._create_new_progress()
 
             except Exception as e:
@@ -226,8 +285,7 @@ class DownloadProgressManager:
 
         return self._create_new_progress()
 
-    def _create_new_progress(self):
-        """创建新的进度数据结构"""
+    def _create_new_progress(self) -> Dict[str, Any]:
         return {
             'metadata': {
                 'repository': self.repository,
@@ -240,21 +298,13 @@ class DownloadProgressManager:
         }
 
     def save_progress(self):
-        """保存下载进度"""
         try:
             with open(self.progress_file, 'w', encoding='utf-8') as f:
                 json.dump(self.progress_data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             logger.error(f'保存进度文件失败: {e}')
 
-    def update_layer_status(self, digest, status, **kwargs):
-        """更新层的下载状态
-
-        Args:
-            digest: 层的digest
-            status: 状态 (pending/downloading/completed/failed)
-            **kwargs: 其他信息（size, downloaded等）
-        """
+    def update_layer_status(self, digest: str, status: str, **kwargs):
         if digest not in self.progress_data['layers']:
             self.progress_data['layers'][digest] = {}
 
@@ -262,107 +312,100 @@ class DownloadProgressManager:
         self.progress_data['layers'][digest].update(kwargs)
         self.save_progress()
 
-    def get_layer_status(self, digest):
-        """获取层的下载状态"""
+    def get_layer_status(self, digest: str) -> Dict[str, Any]:
         return self.progress_data['layers'].get(digest, {})
 
-    def is_layer_completed(self, digest):
-        """检查层是否已完成下载"""
+    def is_layer_completed(self, digest: str) -> bool:
         layer_info = self.get_layer_status(digest)
         return layer_info.get('status') == 'completed'
 
-    def update_config_status(self, status, **kwargs):
-        """更新配置文件状态"""
+    def update_config_status(self, status: str, **kwargs):
         if self.progress_data['config'] is None:
             self.progress_data['config'] = {}
         self.progress_data['config']['status'] = status
         self.progress_data['config'].update(kwargs)
         self.save_progress()
 
-    def is_config_completed(self):
-        """检查配置文件是否已完成下载"""
+    def is_config_completed(self) -> bool:
         config_data = self.progress_data.get('config')
         if config_data is None:
             return False
         return config_data.get('status') == 'completed'
 
     def clear_progress(self):
-        """清除进度文件"""
-        if os.path.exists(self.progress_file):
+        if self.progress_file.exists():
             try:
-                os.remove(self.progress_file)
+                self.progress_file.unlink()
                 logger.debug('进度文件已清除')
             except Exception as e:
                 logger.error(f'清除进度文件失败: {e}')
 
 
-def download_file_with_progress(session, url, headers, save_path, desc, expected_digest=None, max_retries=5):
-    """
-    下载文件，支持断点续传、重试和校验
-
-    Args:
-        session: 请求会话
-        url: 下载URL
-        headers: 请求头
-        save_path: 保存路径
-        desc: 进度条描述
-        expected_digest: 期望的SHA256摘要（可选）
-        max_retries: 最大重试次数
-
-    Returns:
-        bool: 下载是否成功
-    """
+def download_file_with_progress(
+    session: requests.Session,
+    url: str,
+    headers: Dict[str, str],
+    save_path: str,
+    desc: str,
+    expected_digest: Optional[str] = None,
+    max_retries: int = 10,
+    stats: Optional[DownloadStats] = None
+) -> bool:
     for attempt in range(max_retries):
         if stop_event.is_set():
             logger.info('下载被用户取消')
             return False
 
-        # 每次重试时重新计算已下载的大小
         resume_pos = 0
         if os.path.exists(save_path):
             resume_pos = os.path.getsize(save_path)
             if resume_pos > 0:
-                logger.info(f'{desc}: 断点续传，从位置 {resume_pos} 开始')
+                logger.info(f'{desc}: 断点续传，已下载 {resume_pos} 字节')
 
-        # 添加Range头实现断点续传
         download_headers = headers.copy()
         if resume_pos > 0:
             download_headers['Range'] = f'bytes={resume_pos}-'
 
         try:
-            with session.get(url, headers=download_headers, verify=False, timeout=60, stream=True) as resp:
+            with session.get(url, headers=download_headers, verify=False, timeout=120, stream=True) as resp:
+                if resp.status_code == 416:
+                    logger.info(f'{desc}: 文件已完整下载')
+                    return True
+
                 resp.raise_for_status()
 
-                # 获取总大小
                 content_range = resp.headers.get('content-range')
                 if content_range:
                     total_size = int(content_range.split('/')[1])
                 else:
                     total_size = int(resp.headers.get('content-length', 0)) + resume_pos
 
-                # 检查是否需要续传
                 mode = 'ab' if resume_pos > 0 else 'wb'
-
-                # 初始化SHA256计算器
                 sha256_hash = hashlib.sha256() if expected_digest else None
 
-                # 如果是断点续传且需要校验，先读取已下载部分计算哈希
                 if resume_pos > 0 and sha256_hash:
                     logger.debug(f'{desc}: 计算已下载部分的校验和...')
                     with open(save_path, 'rb') as existing_file:
                         while True:
-                            chunk = existing_file.read(8192)
+                            chunk = existing_file.read(65536)
                             if not chunk:
                                 break
                             sha256_hash.update(chunk)
+
+                if stats:
+                    stats.total_size += total_size - resume_pos
+                    if stats.start_time == 0:
+                        stats.start_time = time.time()
 
                 with open(save_path, mode) as file, tqdm(
                         total=total_size, initial=resume_pos, unit='B', unit_scale=True,
                         desc=desc, position=0, leave=True
                 ) as pbar:
                     downloaded_size = resume_pos
+                    last_update_time = time.time()
+                    last_downloaded = resume_pos
 
-                    for chunk in resp.iter_content(chunk_size=8192):
+                    for chunk in resp.iter_content(chunk_size=65536):
                         if stop_event.is_set():
                             logger.info('下载被用户取消')
                             return False
@@ -372,11 +415,18 @@ def download_file_with_progress(session, url, headers, save_path, desc, expected
                             pbar.update(len(chunk))
                             downloaded_size += len(chunk)
 
-                            # 实时计算哈希（包含新下载的部分）
                             if sha256_hash:
                                 sha256_hash.update(chunk)
 
-                # 下载完成，验证哈希
+                            if stats:
+                                current_time = time.time()
+                                if current_time - last_update_time >= 1.0:
+                                    speed = (downloaded_size - last_downloaded) / (current_time - last_update_time)
+                                    stats.speeds.append(speed)
+                                    stats.downloaded_size += downloaded_size - last_downloaded
+                                    last_downloaded = downloaded_size
+                                    last_update_time = current_time
+
                 if expected_digest and sha256_hash:
                     actual_digest = f'sha256:{sha256_hash.hexdigest()}'
                     if actual_digest != expected_digest:
@@ -385,16 +435,14 @@ def download_file_with_progress(session, url, headers, save_path, desc, expected
                         logger.error(f'实际: {actual_digest}')
                         logger.info(f'删除损坏文件，准备重新下载...')
 
-                        # 删除损坏的文件并重试
                         if os.path.exists(save_path):
                             os.remove(save_path)
 
-                        # 等待后重试
                         if attempt < max_retries - 1:
-                            wait_time = (2 ** attempt)
+                            wait_time = min(2 ** attempt, 60)
                             logger.info(f'等待 {wait_time} 秒后重试...')
                             time.sleep(wait_time)
-                        continue  # 重试
+                        continue
 
                     logger.info(f'✅ {desc} 校验成功')
 
@@ -403,48 +451,56 @@ def download_file_with_progress(session, url, headers, save_path, desc, expected
 
         except KeyboardInterrupt:
             logger.info(f'⚠️  下载 {url} 被用户取消')
-            if os.path.exists(save_path):
-                os.remove(save_path)
             return False
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             logger.warning(f'⚠️  {desc} 第 {attempt + 1}/{max_retries} 次下载超时: {e}')
             if attempt < max_retries - 1:
-                wait_time = (2 ** attempt)  # 指数退避：2, 4, 8, 16, 32秒
+                wait_time = min(2 ** attempt, 60)
                 logger.info(f'等待 {wait_time} 秒后重试...')
                 time.sleep(wait_time)
                 continue
             else:
                 logger.error(f'❌ {desc} 下载失败，已达到最大重试次数')
-                if os.path.exists(save_path):
-                    os.remove(save_path)
                 return False
         except requests.exceptions.HTTPError as e:
             logger.warning(f'⚠️  {desc} HTTP错误: {e}')
             if e.response.status_code in [429, 500, 502, 503, 504] and attempt < max_retries - 1:
-                wait_time = (2 ** attempt)
+                wait_time = min(2 ** attempt, 60)
                 logger.info(f'等待 {wait_time} 秒后重试...')
                 time.sleep(wait_time)
                 continue
             else:
                 logger.error(f'❌ {desc} 下载失败: {e}')
-                if os.path.exists(save_path):
-                    os.remove(save_path)
                 return False
         except Exception as e:
             logger.error(f'❌ {desc} 下载失败: {e}')
-            if os.path.exists(save_path):
-                os.remove(save_path)
+            if attempt < max_retries - 1:
+                wait_time = min(2 ** attempt, 60)
+                logger.info(f'等待 {wait_time} 秒后重试...')
+                time.sleep(wait_time)
+                continue
             return False
 
     return False
 
 
-def download_layers(session, registry, repository, layers, auth_head, imgdir, resp_json, imgparts, img, tag, arch):
-    """多线程下载镜像层，支持断点续传、重试和校验"""
+def download_layers(
+    session: requests.Session,
+    registry: str,
+    repository: str,
+    layers: List[Dict],
+    auth_head: Dict[str, str],
+    imgdir: str,
+    resp_json: Dict,
+    imgparts: List[str],
+    img: str,
+    tag: str,
+    arch: str
+):
     os.makedirs(imgdir, exist_ok=True)
 
-    # 创建进度管理器（每个镜像独立的进度文件）
     progress_manager = DownloadProgressManager(repository, tag, arch)
+    stats = DownloadStats()
 
     try:
         config_digest = resp_json['config']['digest']
@@ -452,16 +508,16 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
         config_path = os.path.join(imgdir, config_filename)
         config_url = f'https://{registry}/v2/{repository}/blobs/{config_digest}'
 
-        # 检查配置文件是否已下载完成
         if progress_manager.is_config_completed() and os.path.exists(config_path):
             logger.info(f'✅ Config {config_filename} 已存在，跳过下载')
         else:
             logger.debug(f'下载 Config: {config_filename}')
             progress_manager.update_config_status('downloading', digest=config_digest)
 
-            # 下载配置文件并进行校验
-            if not download_file_with_progress(session, config_url, auth_head, config_path, "Config",
-                                               expected_digest=config_digest):
+            if not download_file_with_progress(
+                session, config_url, auth_head, config_path, "Config",
+                expected_digest=config_digest, stats=stats
+            ):
                 progress_manager.update_config_status('failed')
                 raise Exception(f'Config JSON {config_filename} 下载失败')
 
@@ -474,9 +530,8 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
     repo_tag = f'{"/".join(imgparts)}/{img}:{tag}' if imgparts else f'{img}:{tag}'
     content = [{'Config': config_filename, 'RepoTags': [repo_tag], 'Layers': []}]
     parentid = ''
-    layer_json_map = {}
+    layer_json_map: Dict[str, Dict] = {}
 
-    # 统计需要下载的层
     layers_to_download = []
     skipped_count = 0
 
@@ -490,7 +545,6 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
 
         save_path = f'{layerdir}/layer_gzip.tar'
 
-        # 检查是否已完成下载
         if progress_manager.is_layer_completed(ublob) and os.path.exists(save_path):
             logger.info(f'✅ 层 {ublob[:12]} 已存在，跳过下载')
             skipped_count += 1
@@ -500,20 +554,16 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
     if skipped_count > 0:
         logger.info(f'📦 跳过 {skipped_count} 个已下载的层，还需下载 {len(layers_to_download)} 个层')
 
-    # 多线程下载需要下载的层
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {}
         try:
             for ublob, fake_layerid, layerdir, save_path in layers_to_download:
                 if stop_event.is_set():
-                    raise KeyboardInterrupt  # 检测到终止信号
+                    raise KeyboardInterrupt
 
                 url = f'https://{registry}/v2/{repository}/blobs/{ublob}'
-
-                # 标记为下载中
                 progress_manager.update_layer_status(ublob, 'downloading')
 
-                # 传递digest进行校验
                 futures[executor.submit(
                     download_file_with_progress,
                     session,
@@ -521,12 +571,13 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
                     auth_head,
                     save_path,
                     ublob[:12],
-                    expected_digest=ublob
+                    expected_digest=ublob,
+                    stats=stats
                 )] = (ublob, save_path)
 
             for future in as_completed(futures):
                 if stop_event.is_set():
-                    raise KeyboardInterrupt  # 退出
+                    raise KeyboardInterrupt
 
                 ublob, save_path = futures[future]
                 result = future.result()
@@ -539,22 +590,18 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
 
         except KeyboardInterrupt:
             logging.error("用户终止下载，保存当前进度...")
-            stop_event.set()  # 设置终止标志
+            stop_event.set()
             executor.shutdown(wait=False)
-            # 不删除部分下载的文件，保留用于断点续传
-            raise  # 重新抛出异常，让外层处理
+            raise
 
-    # 解压和处理所有层
     for fake_layerid in layer_json_map.keys():
         if stop_event.is_set():
-            # 检测到终止信号，提前退出
             raise KeyboardInterrupt("用户已取消操作")
 
         layerdir = f'{imgdir}/{fake_layerid}'
         gz_path = f'{layerdir}/layer_gzip.tar'
         tar_path = f'{layerdir}/layer.tar'
 
-        # 解压gzip文件
         if os.path.exists(gz_path):
             with gzip.open(gz_path, 'rb') as gz, open(tar_path, 'wb') as file:
                 shutil.copyfileobj(gz, file)
@@ -574,14 +621,17 @@ def download_layers(session, registry, repository, layers, auth_head, imgdir, re
     with open(repositories_path, 'w') as file:
         json.dump({repository if '/' in repository else img: {tag: parentid}}, file)
 
-    logging.info(f'✅ 镜像 {img}:{tag} 下载完成！')
+    if stats.start_time > 0:
+        elapsed = time.time() - stats.start_time
+        avg_speed = stats.get_avg_speed()
+        logger.info(f'📊 平均下载速度: {stats.format_size(int(avg_speed))}/s')
+        logger.info(f'⏱️  总耗时: {stats.format_time(elapsed)}')
 
-    # 清除进度文件
+    logging.info(f'✅ 镜像 {img}:{tag} 下载完成！')
     progress_manager.clear_progress()
 
 
-def create_image_tar(imgdir, repository, tag, arch):
-    """将镜像打包为 tar 文件"""
+def create_image_tar(imgdir: str, repository: str, tag: str, arch: str) -> str:
     safe_repo = repository.replace("/", "_")
     docker_tar = f'{safe_repo}_{tag}_{arch}.tar'
     try:
@@ -595,7 +645,6 @@ def create_image_tar(imgdir, repository, tag, arch):
 
 
 def cleanup_tmp_dir():
-    """删除 tmp 目录"""
     tmp_dir = 'tmp'
     try:
         if os.path.exists(tmp_dir):
@@ -606,87 +655,167 @@ def cleanup_tmp_dir():
         logger.error(f'清理临时目录失败: {e}')
 
 
+def list_cached_images():
+    if not CACHE_DIR.exists():
+        logger.info('📁 缓存目录不存在')
+        return
+
+    logger.info(f'📁 缓存目录: {CACHE_DIR}')
+    logger.info('=' * 60)
+
+    total_size = 0
+    count = 0
+
+    for item in CACHE_DIR.iterdir():
+        if item.is_dir():
+            progress_file = item / 'progress.json'
+            if progress_file.exists():
+                try:
+                    with open(progress_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    metadata = data.get('metadata', {})
+                    layers = data.get('layers', {})
+
+                    completed = sum(1 for v in layers.values() if v.get('status') == 'completed')
+                    total = len(layers)
+
+                    dir_size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
+                    total_size += dir_size
+
+                    status = '✅ 完成' if completed == total and total > 0 else f'⏳ {completed}/{total}'
+                    logger.info(f'{item.name}: {status} ({dir_size / 1024 / 1024:.1f} MB)')
+                    logger.info(f'   镜像: {metadata.get("repository", "N/A")}:{metadata.get("tag", "N/A")}')
+                    logger.info(f'   架构: {metadata.get("arch", "N/A")}')
+                    logger.info('')
+                    count += 1
+                except Exception as e:
+                    logger.warning(f'读取缓存失败: {item.name} - {e}')
+
+    logger.info('=' * 60)
+    logger.info(f'共 {count} 个缓存，总大小: {total_size / 1024 / 1024:.1f} MB')
+
+
+def clear_cache(repository: Optional[str] = None):
+    if not CACHE_DIR.exists():
+        logger.info('📁 缓存目录不存在')
+        return
+
+    if repository:
+        safe_repo = repository.replace("/", "_").replace(":", "_")
+        for item in CACHE_DIR.iterdir():
+            if item.is_dir() and item.name.startswith(safe_repo):
+                shutil.rmtree(item)
+                logger.info(f'✅ 已清除缓存: {item.name}')
+    else:
+        shutil.rmtree(CACHE_DIR)
+        logger.info(f'✅ 已清除所有缓存')
+
+
 def main():
-    """主函数"""
     try:
-        parser = argparse.ArgumentParser(description="Docker 镜像拉取工具")
+        parser = argparse.ArgumentParser(
+            description="Docker 镜像拉取工具 - 无需Docker环境直接下载镜像",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+示例:
+  %(prog)s -i nginx:latest
+  %(prog)s -i harbor.example.com/library/nginx:1.26.0 -u admin -p password
+  %(prog)s -i alpine:latest -a arm64v8
+  %(prog)s --list-cache
+  %(prog)s --clear-cache
+            """
+        )
         parser.add_argument("-i", "--image", required=False,
                             help="Docker 镜像名称（例如：nginx:latest 或 harbor.abc.com/abc/nginx:1.26.0）")
         parser.add_argument("-q", "--quiet", action="store_true", help="静默模式，减少交互")
-        parser.add_argument("-r", "--custom_registry", help="自定义仓库地址（例如：harbor.abc.com）")
-        parser.add_argument("-a", "--arch", help="架构,默认：amd64,常见：amd64, arm64v8等")
+        parser.add_argument("-r", "--custom-registry", help="自定义仓库地址（例如：harbor.abc.com）")
+        parser.add_argument("-a", "--arch", default="amd64", help="架构,默认：amd64,常见：amd64, arm64v8等")
         parser.add_argument("-u", "--username", help="Docker 仓库用户名")
         parser.add_argument("-p", "--password", help="Docker 仓库密码")
         parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {VERSION}", help="显示版本信息")
         parser.add_argument("--debug", action="store_true", help="启用调试模式，打印请求 URL 和连接状态")
+        parser.add_argument("--list-cache", action="store_true", help="列出缓存的镜像")
+        parser.add_argument("--clear-cache", action="store_true", help="清除所有缓存")
+        parser.add_argument("--workers", type=int, default=4, help="并发下载线程数，默认4")
 
-        # 显示程序的信息
-        logger.info(f'欢迎使用 Docker 镜像拉取工具 {VERSION}')
+        logger.info(f'🚀 Docker 镜像拉取工具 {VERSION}')
 
         args = parser.parse_args()
 
         if args.debug:
             logger.setLevel(logging.DEBUG)
 
-        # 获取镜像名称
+        if args.list_cache:
+            list_cached_images()
+            return
+
+        if args.clear_cache:
+            clear_cache()
+            return
+
         if not args.image:
             args.image = input("请输入 Docker 镜像名称（例如：nginx:latest 或 harbor.abc.com/abc/nginx:1.26.0）：").strip()
             if not args.image:
                 logger.error("错误：镜像名称是必填项。")
                 return
 
-        # # 获取架构
-        # if not args.arch and not args.quiet:
-        #     args.arch = input("请输入架构（常见: amd64, arm64v8等，默认: amd64）：").strip() or 'amd64'
-
-        # 获取自定义仓库地址
         if not args.custom_registry and not args.quiet:
-            # use_custom_registry = input("是否使用自定义仓库地址？(y/n, 默认: y): ").strip().lower() or 'y'
-            # if use_custom_registry == 'y':
-            #     args.custom_registry = input("请输入自定义仓库地址: )").strip()
-            args.custom_registry = input("请输入自定义仓库地址: （默认 dockerhub）").strip()
+            args.custom_registry = input("请输入自定义仓库地址（默认 dockerhub）：").strip() or None
 
-        # 解析镜像信息
-        registry, repository, img, tag = parse_image_input(args)
+        image_info = parse_image_input(args.image, args.custom_registry)
 
-        # 获取认证信息
         if not args.username and not args.quiet:
-            args.username = input("请输入镜像仓库用户名: ").strip()
+            args.username = input("请输入镜像仓库用户名：").strip() or None
         if not args.password and not args.quiet:
-            args.password = input("请输入镜像仓库密码: ").strip()
-        session = create_session()
+            args.password = input("请输入镜像仓库密码：").strip() or None
+
+        session = SessionManager.get_session()
         auth_head = None
+
         try:
-            url = f'https://{registry}/v2/'
-            logger.debug(f"获取认证信息 CURL 命令: curl '{url}'")
-            resp = session.get(url, verify=False, timeout=30)
+            url = f'https://{image_info.registry}/v2/'
+            logger.debug(f"获取认证信息: {url}")
+            resp = session.get(url, verify=False, timeout=60)
             auth_url = resp.headers['WWW-Authenticate'].split('"')[1]
             reg_service = resp.headers['WWW-Authenticate'].split('"')[3]
-            auth_head = get_auth_head(session, auth_url, reg_service, repository, args.username, args.password)
-            # 获取清单
-            resp, http_code = fetch_manifest(session, registry, repository, tag, auth_head)
+            auth_head = get_auth_head(
+                session, auth_url, reg_service, image_info.repository,
+                args.username, args.password
+            )
+
+            resp, http_code = fetch_manifest(
+                session, image_info.registry, image_info.repository,
+                image_info.tag, auth_head
+            )
+
             if http_code == 401:
-                use_auth = input(f"当前仓库 {registry}，需要登录？(y/n, 默认: y): ").strip().lower() or 'y'
+                use_auth = input(f"当前仓库 {image_info.registry}，需要登录？(y/n, 默认: y): ").strip().lower() or 'y'
                 if use_auth == 'y':
                     args.username = input("请输入用户名: ").strip()
                     args.password = input("请输入密码: ").strip()
-                auth_head = get_auth_head(session, auth_url, reg_service, repository, args.username, args.password)
+                auth_head = get_auth_head(
+                    session, auth_url, reg_service, image_info.repository,
+                    args.username, args.password
+                )
 
-            resp, http_code = fetch_manifest(session, registry, repository, tag, auth_head)
+            resp, http_code = fetch_manifest(
+                session, image_info.registry, image_info.repository,
+                image_info.tag, auth_head
+            )
         except requests.exceptions.RequestException as e:
             logger.error(f'连接仓库失败: {e}')
             raise
 
         resp_json = resp.json()
 
-        # 处理多架构镜像
         manifests = resp_json.get('manifests')
         if manifests is not None:
-            archs = [m.get('annotations', {}).get('com.docker.official-images.bashbrew.arch') or
-                     m.get('platform', {}).get('architecture')
-                     for m in manifests if m.get('platform', {}).get('os') == 'linux']
+            archs = [
+                m.get('annotations', {}).get('com.docker.official-images.bashbrew.arch') or
+                m.get('platform', {}).get('architecture')
+                for m in manifests if m.get('platform', {}).get('os') == 'linux'
+            ]
 
-            # 打印架构列表
             if archs:
                 logger.debug(f'当前可用架构：{", ".join(archs)}')
 
@@ -694,7 +823,6 @@ def main():
                 args.arch = archs[0]
                 logger.info(f'自动选择唯一可用架构: {args.arch}')
 
-            # 获取架构
             if not args.arch or args.arch not in archs:
                 args.arch = input(f"请输入架构（可选: {', '.join(archs)}，默认: amd64）：").strip() or 'amd64'
 
@@ -703,14 +831,10 @@ def main():
                 logger.error(f'在清单中找不到指定的架构 {args.arch}')
                 return
 
-            # 构造请求
-            url = f'https://{registry}/v2/{repository}/manifests/{digest}'
-            headers = ' '.join([f"-H '{key}: {value}'" for key, value in auth_head.items()])
-            curl_command = f"curl '{url}' {headers}"
-            logger.debug(f'获取架构清单 CURL 命令: {curl_command}')
+            url = f'https://{image_info.registry}/v2/{image_info.repository}/manifests/{digest}'
+            logger.debug(f'获取架构清单: {url}')
 
-            # 获取清单
-            manifest_resp = session.get(url, headers=auth_head, verify=False, timeout=30)
+            manifest_resp = session.get(url, headers=auth_head, verify=False, timeout=60)
             try:
                 manifest_resp.raise_for_status()
                 resp_json = manifest_resp.json()
@@ -726,63 +850,59 @@ def main():
                 logger.error('错误：清单中没有配置信息')
                 return
 
-        # 最终检查：确保清单完整
         if 'layers' not in resp_json or 'config' not in resp_json:
             logger.error('错误：清单格式不完整，缺少必要字段')
             logger.debug(f'清单内容: {resp_json.keys()}')
             return
 
-        logger.info(f'仓库地址：{registry}')
-        logger.info(f'镜像：{repository}')
-        logger.info(f'标签：{tag}')
-        logger.info(f'架构：{args.arch}')
+        logger.info(f'📦 仓库地址：{image_info.registry}')
+        logger.info(f'📦 镜像：{image_info.repository}')
+        logger.info(f'📦 标签：{image_info.tag}')
+        logger.info(f'📦 架构：{args.arch}')
 
-        # 下载镜像层
-        imgdir = 'tmp'
+        cache_dir = get_cache_dir(image_info.repository, image_info.tag, args.arch)
+        imgdir = str(cache_dir / 'layers')
         os.makedirs(imgdir, exist_ok=True)
-        logger.info('开始下载')
+        logger.info(f'📁 缓存目录：{cache_dir}')
+        logger.info('📥 开始下载...')
 
-        # 根据镜像类型，提供正确的imgparts
-        if registry == 'registry-1.docker.io' and repository.startswith('library/'):
-            # Docker Hub
-            imgparts = []  # 官方镜像不需要前缀
+        if image_info.registry == 'registry-1.docker.io' and image_info.repository.startswith('library/'):
+            imgparts = []
         else:
-            #
-            imgparts = repository.split('/')[:-1]
+            imgparts = image_info.repository.split('/')[:-1]
 
-        download_layers(session, registry, repository, resp_json['layers'], auth_head, imgdir, resp_json, imgparts, img,
-                        tag, args.arch)
+        download_layers(
+            session, image_info.registry, image_info.repository,
+            resp_json['layers'], auth_head, imgdir, resp_json,
+            imgparts, image_info.image_name, image_info.tag, args.arch
+        )
 
-        # 打包镜像
-        output_file = create_image_tar(imgdir, repository, tag, args.arch)
-        logger.info(f'镜像已保存为: {output_file}')
-        logger.info(f'可使用以下命令导入镜像: docker load -i {output_file}')
-        if registry not in ("registry-1.docker.io", "docker.io"):
-            logger.info(f'您可能需要: docker tag {repository}:{tag} {registry}/{repository}:{tag}')
-
-
+        output_file = create_image_tar(imgdir, image_info.repository, image_info.tag, args.arch)
+        logger.info(f'✅ 镜像已保存为: {output_file}')
+        logger.info(f'💡 导入命令: docker load -i {output_file}')
+        if image_info.registry not in ("registry-1.docker.io", "docker.io"):
+            logger.info(f'💡 标签命令: docker tag {image_info.repository}:{image_info.tag} {image_info.registry}/{image_info.repository}:{image_info.tag}')
 
     except KeyboardInterrupt:
-        logger.info('用户取消操作。')
+        logger.info('⚠️ 用户取消操作。')
     except requests.exceptions.RequestException as e:
-        logger.error(f'网络连接失败: {e}')
+        logger.error(f'❌ 网络连接失败: {e}')
     except json.JSONDecodeError as e:
-        logger.error(f'JSON解析失败: {e}')
+        logger.error(f'❌ JSON解析失败: {e}')
     except FileNotFoundError as e:
-        logger.error(f'文件操作失败: {e}')
+        logger.error(f'❌ 文件操作失败: {e}')
     except argparse.ArgumentError as e:
-        logger.error(f'命令行参数错误: {e}')
+        logger.error(f'❌ 命令行参数错误: {e}')
     except Exception as e:
-        logger.error(f'程序运行过程中发生异常: {e}')
+        logger.error(f'❌ 程序运行过程中发生异常: {e}')
         import traceback
         logger.debug(traceback.format_exc())
 
     finally:
         cleanup_tmp_dir()
         try:
-            input("按任意键退出程序...")
+            input("\n按回车键退出程序...")
         except (KeyboardInterrupt, EOFError):
-            # 用户按Ctrl+C或在非交互环境中运行
             pass
         sys.exit(0)
 
