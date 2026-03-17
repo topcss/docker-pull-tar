@@ -817,6 +817,27 @@ def main():
             if 'config' not in resp_json:
                 logger.error('错误：清单中没有配置信息')
                 return
+        else:
+            config_digest = resp_json.get('config', {}).get('digest')
+            if config_digest:
+                config_url = f'https://{image_info.registry}/v2/{image_info.repository}/blobs/{config_digest}'
+                logger.debug(f'获取镜像配置: {config_url}')
+                try:
+                    config_resp = session.get(config_url, headers=auth_head, verify=False, timeout=60)
+                    config_resp.raise_for_status()
+                    config_json = config_resp.json()
+                    actual_arch = config_json.get('architecture', 'unknown')
+                    actual_os = config_json.get('os', 'unknown')
+                    logger.info(f'📋 镜像架构信息: {actual_os}/{actual_arch}')
+                    
+                    if actual_arch != args.arch:
+                        logger.warning(f'⚠️  当前镜像架构为 {actual_arch}，与请求的 {args.arch} 不匹配')
+                        if not args.quiet:
+                            use_actual = input(f'是否使用镜像实际架构 {actual_arch}？(y/n, 默认: y): ').strip().lower() or 'y'
+                            if use_actual == 'y':
+                                args.arch = actual_arch
+                except Exception as e:
+                    logger.warning(f'获取镜像配置失败: {e}')
 
         if 'layers' not in resp_json or 'config' not in resp_json:
             logger.error('错误：清单格式不完整，缺少必要字段')
