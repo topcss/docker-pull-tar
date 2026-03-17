@@ -123,7 +123,9 @@ class ProgressDisplay:
         self.layers: Dict[str, LayerProgress] = {}
         self.stats: Optional[DownloadStats] = None
         self.last_update = 0
-        self.update_interval = 0.1
+        self.update_interval = 0.2
+        self.initialized = False
+        self.last_line_count = 0
 
     def add_layer(self, name: str, total_size: int, index: int, total_layers: int):
         with progress_lock:
@@ -164,13 +166,18 @@ class ProgressDisplay:
             if self.stats:
                 speed = self.stats.get_avg_speed()
                 speed_str = self.stats.format_size(int(speed)) if speed > 0 else "0B"
-                lines.append(f"\n📊 速度: {speed_str}/s")
+                lines.append(f"📊 速度: {speed_str}/s")
 
-            sys.stdout.write('\033[F' * (len(lines) + 1))
-            sys.stdout.write('\033[J')
-            print()
+            if self.initialized and self.last_line_count > 0:
+                for _ in range(self.last_line_count):
+                    sys.stdout.write('\033[F')
+                sys.stdout.write('\033[J')
+            
             for line in lines:
                 print(line)
+            
+            self.last_line_count = len(lines)
+            self.initialized = True
             sys.stdout.flush()
 
     def _format_layer_line(self, layer: LayerProgress) -> str:
@@ -200,7 +207,9 @@ class ProgressDisplay:
                 line = self._format_layer_line(layer)
                 print(line)
             if self.stats:
-                print(f"\n📊 速度: 计算中...")
+                print(f"📊 速度: 计算中...")
+            self.last_line_count = len(self.layers) + 1
+            self.initialized = True
 
 
 progress_display = ProgressDisplay()
