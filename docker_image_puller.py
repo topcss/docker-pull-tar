@@ -14,7 +14,6 @@ warnings.filterwarnings('ignore', category=UserWarning, module='requests')
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from tqdm import tqdm
 import tarfile
 import urllib3
 import argparse
@@ -32,7 +31,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 urllib3.disable_warnings()
 
-VERSION = "v1.6.1"
+VERSION = "v1.7.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,9 +41,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 stop_event = threading.Event()
-download_lock = threading.Lock()
-progress_positions: Dict[str, int] = {}
-current_position = 0
+progress_lock = threading.Lock()
 
 
 def signal_handler(signum, frame):
@@ -78,9 +75,9 @@ class DownloadStats:
     def format_size(self, size: int) -> str:
         for unit in ['B', 'KB', 'MB', 'GB']:
             if size < 1024:
-                return f"{size:.2f} {unit}"
+                return f"{size:.1f}{unit}"
             size /= 1024
-        return f"{size:.2f} TB"
+        return f"{size:.1f}TB"
 
     def format_time(self, seconds: float) -> str:
         if seconds < 60:
@@ -89,6 +86,116 @@ class DownloadStats:
             return f"{int(seconds // 60)}分{int(seconds % 60)}秒"
         else:
             return f"{int(seconds // 3600)}小时{int((seconds % 3600) // 60)}分"
+
+
+class LayerProgress:
+    def __init__(self, name: str, total_size: int, index: int, total_layers: int):
+        self.name = name
+        self.total_size = total_size
+        self.downloaded_size = 0
+        self.index = index
+        self.total_layers = total_layers
+        self.status = 'waiting'
+        self.chunk_count = 0
+        self.total_chunks = 0
+        self.current_chunk = 0
+
+    def update(self, downloaded: int, chunk_info: str = ''):
+        self.downloaded_size = downloaded
+        self.chunk_info = chunk_info
+
+    def set_chunk_info(self, current: int, total: int):
+        self.current_chunk = current
+        self.total_chunks = total
+
+
+class ProgressDisplay:
+    def __init__(self, bar_width: int = 30):
+        self.bar_width = bar_width
+        self.layers: Dict[str, LayerProgress] = {}
+        self.stats: Optional[DownloadStats] = None
+        self.last_update = 0
+        self.update_interval = 0.1
+
+    def add_layer(self, name: str, total_size: int, index: int, total_layers: int):
+        with progress_lock:
+            self.layers[name] = LayerProgress(name, total_size, index, total_layers)
+
+    def update_layer(self, name: str, downloaded: int):
+        with progress_lock:
+            if name in self.layers:
+                self.layers[name].downloaded_size = downloaded
+                self.layers[name].status = 'downloading'
+        self._refresh_display()
+
+    def complete_layer(self, name: str):
+        with progress_lock:
+            if name in self.layers:
+                self.layers[name].downloaded_size = self.layers[name].total_size
+                self.layers[name].status = 'completed'
+        self._refresh_display()
+
+    def set_chunk_info(self, name: str, current: int, total: int):
+        with progress_lock:
+            if name in self.layers:
+                self.layers[name].current_chunk = current
+                self.layers[name].total_chunks = total
+
+    def _refresh_display(self):
+        current_time = time.time()
+        if current_time - self.last_update < self.update_interval:
+            return
+        self.last_update = current_time
+
+        with progress_lock:
+            lines = []
+            for name, layer in sorted(self.layers.items(), key=lambda x: x[1].index):
+                line = self._format_layer_line(layer)
+                lines.append(line)
+            
+            if self.stats:
+                speed = self.stats.get_avg_speed()
+                speed_str = self.stats.format_size(int(speed)) if speed > 0 else "0B"
+                lines.append(f"\n📊 速度: {speed_str}/s")
+
+            sys.stdout.write('\033[F' * (len(lines) + 1))
+            sys.stdout.write('\033[J')
+            print()
+            for line in lines:
+                print(line)
+            sys.stdout.flush()
+
+    def _format_layer_line(self, layer: LayerProgress) -> str:
+        if layer.total_size > 0:
+            progress = layer.downloaded_size / layer.total_size
+        else:
+            progress = 0
+
+        filled = int(self.bar_width * progress)
+        empty = self.bar_width - filled
+        
+        bar = '█' * filled + '░' * empty
+        
+        size_str = f"{layer.format_size(layer.downloaded_size)}/{layer.format_size(layer.total_size)}"
+        
+        chunk_info = ""
+        if layer.total_chunks > 0:
+            chunk_info = f" [{layer.current_chunk}/{layer.total_chunks}]"
+        
+        status_icon = "✅" if layer.status == 'completed' else "⬇️"
+        
+        return f"  {status_icon} {layer.name[:12]:<12} |{bar}| {progress*100:5.1f}% {size_str:>15}{chunk_info} ({layer.index}/{layer.total_layers})"
+
+    def print_initial(self):
+        with progress_lock:
+            for name, layer in sorted(self.layers.items(), key=lambda x: x[1].index):
+                line = self._format_layer_line(layer)
+                print(line)
+            if self.stats:
+                print(f"\n📊 速度: 计算中...")
+
+
+progress_display = ProgressDisplay()
 
 
 class SessionManager:
@@ -348,13 +455,14 @@ class DownloadProgressManager:
                 logger.error(f'清除进度文件失败: {e}')
 
 
-def get_progress_position(desc: str) -> int:
-    global current_position
-    with download_lock:
-        if desc not in progress_positions:
-            progress_positions[desc] = current_position
-            current_position += 1
-        return progress_positions[desc]
+def get_file_size(session: requests.Session, url: str, headers: Dict[str, str]) -> int:
+    try:
+        resp = session.head(url, headers=headers, verify=False, timeout=30)
+        if resp.status_code == 200:
+            return int(resp.headers.get('content-length', 0))
+    except:
+        pass
+    return 0
 
 
 def download_file_with_progress(
@@ -366,21 +474,17 @@ def download_file_with_progress(
     expected_digest: Optional[str] = None,
     max_retries: int = 10,
     stats: Optional[DownloadStats] = None,
-    position: int = 0,
     chunk_size: int = 10 * 1024 * 1024
 ) -> bool:
     CHUNK_THRESHOLD = 50 * 1024 * 1024
     
     for attempt in range(max_retries):
         if stop_event.is_set():
-            logger.info('下载被用户取消')
             return False
 
         resume_pos = 0
         if os.path.exists(save_path):
             resume_pos = os.path.getsize(save_path)
-            if resume_pos > 0:
-                logger.info(f'{desc}: 断点续传，已下载 {resume_pos} 字节')
 
         download_headers = headers.copy()
         if resume_pos > 0:
@@ -389,7 +493,7 @@ def download_file_with_progress(
         try:
             with session.get(url, headers=download_headers, verify=False, timeout=120, stream=True) as resp:
                 if resp.status_code == 416:
-                    logger.info(f'{desc}: 文件已完整下载')
+                    progress_display.complete_layer(desc)
                     return True
 
                 resp.raise_for_status()
@@ -401,17 +505,15 @@ def download_file_with_progress(
                     total_size = int(resp.headers.get('content-length', 0)) + resume_pos
 
                 if total_size - resume_pos > CHUNK_THRESHOLD and resume_pos == 0:
-                    logger.info(f'{desc}: 大文件 ({total_size / 1024 / 1024:.1f} MB)，启用分片下载')
                     return download_file_in_chunks(
                         session, url, headers, save_path, desc, 
-                        total_size, expected_digest, max_retries, stats, position, chunk_size
+                        total_size, expected_digest, max_retries, stats, chunk_size
                     )
 
                 mode = 'ab' if resume_pos > 0 else 'wb'
                 sha256_hash = hashlib.sha256() if expected_digest else None
 
                 if resume_pos > 0 and sha256_hash:
-                    logger.debug(f'{desc}: 计算已下载部分的校验和...')
                     with open(save_path, 'rb') as existing_file:
                         while True:
                             chunk = existing_file.read(65536)
@@ -424,33 +526,29 @@ def download_file_with_progress(
                     if stats.start_time == 0:
                         stats.start_time = time.time()
 
-                with open(save_path, mode) as file, tqdm(
-                        total=total_size, initial=resume_pos, unit='B', unit_scale=True,
-                        desc=desc, position=position, leave=False
-                ) as pbar:
-                    downloaded_size = resume_pos
-                    last_update_time = time.time()
-                    last_downloaded = resume_pos
+                downloaded_size = resume_pos
+                last_update_time = time.time()
+                last_downloaded = resume_pos
 
+                with open(save_path, mode) as file:
                     for chunk in resp.iter_content(chunk_size=65536):
                         if stop_event.is_set():
-                            logger.info('下载被用户取消')
                             return False
 
                         if chunk:
                             file.write(chunk)
-                            pbar.update(len(chunk))
                             downloaded_size += len(chunk)
 
                             if sha256_hash:
                                 sha256_hash.update(chunk)
 
+                            progress_display.update_layer(desc, downloaded_size)
+
                             if stats:
                                 current_time = time.time()
-                                if current_time - last_update_time >= 1.0:
+                                if current_time - last_update_time >= 0.5:
                                     speed = (downloaded_size - last_downloaded) / (current_time - last_update_time)
                                     stats.speeds.append(speed)
-                                    stats.downloaded_size += downloaded_size - last_downloaded
                                     last_downloaded = downloaded_size
                                     last_update_time = current_time
 
@@ -458,42 +556,29 @@ def download_file_with_progress(
                     actual_digest = f'sha256:{sha256_hash.hexdigest()}'
                     if actual_digest != expected_digest:
                         logger.error(f'❌ {desc} 校验失败！')
-                        logger.error(f'期望: {expected_digest}')
-                        logger.error(f'实际: {actual_digest}')
-                        logger.info(f'删除损坏文件，准备重新下载...')
-
                         if os.path.exists(save_path):
                             os.remove(save_path)
-
                         if attempt < max_retries - 1:
                             wait_time = min(2 ** attempt, 60)
-                            logger.info(f'等待 {wait_time} 秒后重试...')
                             time.sleep(wait_time)
                         continue
 
-                    logger.info(f'✅ {desc} 校验成功')
-
-                logger.info(f'✅ {desc} 下载完成')
+                progress_display.complete_layer(desc)
                 return True
 
         except KeyboardInterrupt:
-            logger.info(f'⚠️  下载 {url} 被用户取消')
             return False
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            logger.warning(f'⚠️  {desc} 第 {attempt + 1}/{max_retries} 次下载超时: {e}')
             if attempt < max_retries - 1:
                 wait_time = min(2 ** attempt, 60)
-                logger.info(f'等待 {wait_time} 秒后重试...')
                 time.sleep(wait_time)
                 continue
             else:
-                logger.error(f'❌ {desc} 下载失败，已达到最大重试次数')
+                logger.error(f'❌ {desc} 下载失败')
                 return False
         except requests.exceptions.HTTPError as e:
-            logger.warning(f'⚠️  {desc} HTTP错误: {e}')
             if e.response.status_code in [429, 500, 502, 503, 504] and attempt < max_retries - 1:
                 wait_time = min(2 ** attempt, 60)
-                logger.info(f'等待 {wait_time} 秒后重试...')
                 time.sleep(wait_time)
                 continue
             else:
@@ -503,7 +588,6 @@ def download_file_with_progress(
             logger.error(f'❌ {desc} 下载失败: {e}')
             if attempt < max_retries - 1:
                 wait_time = min(2 ** attempt, 60)
-                logger.info(f'等待 {wait_time} 秒后重试...')
                 time.sleep(wait_time)
                 continue
             return False
@@ -521,11 +605,12 @@ def download_file_in_chunks(
     expected_digest: Optional[str] = None,
     max_retries: int = 10,
     stats: Optional[DownloadStats] = None,
-    position: int = 0,
     chunk_size: int = 10 * 1024 * 1024
 ) -> bool:
     num_chunks = (total_size + chunk_size - 1) // chunk_size
     temp_dir = save_path + '.chunks'
+    
+    progress_display.set_chunk_info(desc, 0, num_chunks)
     
     try:
         os.makedirs(temp_dir, exist_ok=True)
@@ -549,58 +634,57 @@ def download_file_in_chunks(
         
         sha256_hash = hashlib.sha256() if expected_digest else None
         
-        with tqdm(total=total_size, initial=completed_size, unit='B', unit_scale=True,
-                  desc=desc, position=position, leave=False) as pbar:
+        for i, (start, end, chunk_file) in enumerate(chunk_files):
+            if stop_event.is_set():
+                return False
             
-            for i, (start, end, chunk_file) in enumerate(chunk_files):
+            progress_display.set_chunk_info(desc, i + 1, num_chunks)
+            
+            if os.path.exists(chunk_file):
+                existing_size = os.path.getsize(chunk_file)
+                if existing_size == end - start:
+                    if sha256_hash:
+                        with open(chunk_file, 'rb') as f:
+                            while True:
+                                data = f.read(65536)
+                                if not data:
+                                    break
+                                sha256_hash.update(data)
+                    completed_size += (end - start)
+                    progress_display.update_layer(desc, completed_size)
+                    continue
+            
+            chunk_headers = headers.copy()
+            chunk_headers['Range'] = f'bytes={start}-{end-1}'
+            
+            for attempt in range(max_retries):
                 if stop_event.is_set():
-                    logger.info('下载被用户取消')
                     return False
                 
-                if os.path.exists(chunk_file):
-                    existing_size = os.path.getsize(chunk_file)
-                    if existing_size == end - start:
-                        if sha256_hash:
-                            with open(chunk_file, 'rb') as f:
-                                while True:
-                                    data = f.read(65536)
-                                    if not data:
-                                        break
-                                    sha256_hash.update(data)
-                        pbar.update(end - start)
-                        continue
-                
-                chunk_headers = headers.copy()
-                chunk_headers['Range'] = f'bytes={start}-{end-1}'
-                
-                for attempt in range(max_retries):
-                    if stop_event.is_set():
-                        return False
-                    
-                    try:
-                        with session.get(url, headers=chunk_headers, verify=False, timeout=120, stream=True) as resp:
-                            resp.raise_for_status()
-                            
-                            with open(chunk_file, 'wb') as f:
-                                for data in resp.iter_content(chunk_size=65536):
-                                    if stop_event.is_set():
-                                        return False
-                                    if data:
-                                        f.write(data)
-                                        pbar.update(len(data))
-                                        if sha256_hash:
-                                            sha256_hash.update(data)
+                try:
+                    chunk_downloaded = 0
+                    with session.get(url, headers=chunk_headers, verify=False, timeout=120, stream=True) as resp:
+                        resp.raise_for_status()
+                        
+                        with open(chunk_file, 'wb') as f:
+                            for data in resp.iter_content(chunk_size=65536):
+                                if stop_event.is_set():
+                                    return False
+                                if data:
+                                    f.write(data)
+                                    chunk_downloaded += len(data)
+                                    completed_size += len(data)
+                                    if sha256_hash:
+                                        sha256_hash.update(data)
+                                    progress_display.update_layer(desc, completed_size)
                         break
-                    except Exception as e:
-                        if attempt < max_retries - 1:
-                            wait_time = min(2 ** attempt, 60)
-                            logger.warning(f'{desc}: 分片 {i+1} 下载失败，{wait_time}秒后重试: {e}')
-                            time.sleep(wait_time)
-                        else:
-                            logger.error(f'❌ {desc}: 分片 {i+1} 下载失败')
-                            raise
-        
-        logger.info(f'{desc}: 合并 {num_chunks} 个分片...')
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait_time = min(2 ** attempt, 60)
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f'❌ {desc}: 分片 {i+1} 下载失败')
+                        raise
         
         with open(save_path, 'wb') as outfile:
             for i, (_, _, chunk_file) in enumerate(chunk_files):
@@ -623,9 +707,8 @@ def download_file_in_chunks(
                 if os.path.exists(save_path):
                     os.remove(save_path)
                 return False
-            logger.info(f'✅ {desc} 校验成功')
         
-        logger.info(f'✅ {desc} 分片下载完成')
+        progress_display.complete_layer(desc)
         return True
         
     except Exception as e:
@@ -649,14 +732,14 @@ def download_layers(
     arch: str,
     output_dir: Path
 ):
-    global current_position, progress_positions
-    current_position = 0
-    progress_positions = {}
+    global progress_display
+    progress_display = ProgressDisplay()
 
     os.makedirs(imgdir, exist_ok=True)
 
     progress_manager = DownloadProgressManager(output_dir, repository, tag, arch)
     stats = DownloadStats()
+    progress_display.stats = stats
 
     try:
         config_digest = resp_json['config']['digest']
@@ -665,17 +748,18 @@ def download_layers(
         config_url = f'https://{registry}/v2/{repository}/blobs/{config_digest}'
 
         if progress_manager.is_config_completed() and os.path.exists(config_path):
-            logger.info(f'✅ Config {config_filename} 已存在，跳过下载')
+            logger.info(f'✅ Config 已存在，跳过下载')
         else:
-            logger.debug(f'下载 Config: {config_filename}')
             progress_manager.update_config_status('downloading', digest=config_digest)
-
+            config_size = get_file_size(session, config_url, auth_head)
+            progress_display.add_layer('Config', config_size, 0, len(layers) + 1)
+            
             if not download_file_with_progress(
                 session, config_url, auth_head, config_path, "Config",
-                expected_digest=config_digest, stats=stats, position=0
+                expected_digest=config_digest, stats=stats
             ):
                 progress_manager.update_config_status('failed')
-                raise Exception(f'Config JSON {config_filename} 下载失败')
+                raise Exception(f'Config 下载失败')
 
             progress_manager.update_config_status('completed', digest=config_digest)
 
@@ -702,13 +786,19 @@ def download_layers(
         save_path = f'{layerdir}/layer_gzip.tar'
 
         if progress_manager.is_layer_completed(ublob) and os.path.exists(save_path):
-            logger.info(f'✅ 层 {ublob[:12]} 已存在，跳过下载')
             skipped_count += 1
         else:
             layers_to_download.append((ublob, fake_layerid, layerdir, save_path))
 
     if skipped_count > 0:
         logger.info(f'📦 跳过 {skipped_count} 个已下载的层，还需下载 {len(layers_to_download)} 个层')
+
+    for idx, (ublob, fake_layerid, layerdir, save_path) in enumerate(layers_to_download):
+        url = f'https://{registry}/v2/{repository}/blobs/{ublob}'
+        layer_size = get_file_size(session, url, auth_head)
+        progress_display.add_layer(ublob[:12], layer_size, idx + 1, len(layers_to_download))
+
+    progress_display.print_initial()
 
     num_workers = min(len(layers_to_download), 4) if layers_to_download else 1
 
@@ -722,8 +812,6 @@ def download_layers(
                 url = f'https://{registry}/v2/{repository}/blobs/{ublob}'
                 progress_manager.update_layer_status(ublob, 'downloading')
 
-                position = idx + 1
-
                 futures[executor.submit(
                     download_file_with_progress,
                     session,
@@ -732,8 +820,7 @@ def download_layers(
                     save_path,
                     ublob[:12],
                     expected_digest=ublob,
-                    stats=stats,
-                    position=position
+                    stats=stats
                 )] = (ublob, save_path)
 
             for future in as_completed(futures):
