@@ -539,6 +539,8 @@ def download_file_with_progress(
         resume_pos = 0
         if os.path.exists(save_path):
             resume_pos = os.path.getsize(save_path)
+            if resume_pos > 0 and attempt == 0:
+                logger.info(f'📎 {desc} 检测到已下载 {LayerProgress.format_size(resume_pos)}，尝试断点续传...')
 
         download_headers = headers.copy()
         if resume_pos > 0:
@@ -625,6 +627,7 @@ def download_file_with_progress(
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             if attempt < max_retries - 1:
                 wait_time = min(2 ** attempt, 60)
+                logger.info(f'🔄 {desc} 连接超时/失败，{wait_time}秒后重试 ({attempt + 1}/{max_retries})')
                 time.sleep(wait_time)
                 continue
             else:
@@ -633,17 +636,19 @@ def download_file_with_progress(
         except requests.exceptions.HTTPError as e:
             if e.response.status_code in [429, 500, 502, 503, 504] and attempt < max_retries - 1:
                 wait_time = min(2 ** attempt, 60)
+                logger.info(f'🔄 {desc} HTTP {e.response.status_code}，{wait_time}秒后重试 ({attempt + 1}/{max_retries})')
                 time.sleep(wait_time)
                 continue
             else:
                 logger.error(f'❌ {desc} 下载失败: {e}')
                 return False
         except Exception as e:
-            logger.error(f'❌ {desc} 下载失败: {e}')
             if attempt < max_retries - 1:
                 wait_time = min(2 ** attempt, 60)
+                logger.info(f'🔄 {desc} 下载异常，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}')
                 time.sleep(wait_time)
                 continue
+            logger.error(f'❌ {desc} 下载失败: {e}')
             return False
 
     return False
@@ -732,7 +737,7 @@ def download_file_in_chunks(
                 except Exception as e:
                     if attempt < max_retries - 1:
                         wait_time = min(2 ** attempt, 60)
-                        logger.debug(f'{desc} 分片 {i+1} 下载失败，{wait_time}秒后重试: {e}')
+                        logger.info(f'🔄 {desc} 分片 {i+1} 下载失败，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}')
                         time.sleep(wait_time)
                         continue
                     else:
