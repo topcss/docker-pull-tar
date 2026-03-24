@@ -133,6 +133,9 @@ class LayerProgress:
         self.current_chunk = current
         self.total_chunks = total
 
+    def set_total_size(self, total_size: int):
+        self.total_size = total_size
+
     @staticmethod
     def format_size(size: int) -> str:
         for unit in ['B', 'KB', 'MB', 'GB']:
@@ -163,11 +166,20 @@ class ProgressDisplay:
                 self.layers[name].status = 'downloading'
         self._refresh_display()
 
+    def update_layer_size(self, name: str, total_size: int):
+        with progress_lock:
+            if name in self.layers:
+                self.layers[name].set_total_size(total_size)
+
     def complete_layer(self, name: str):
         with progress_lock:
             if name in self.layers:
-                self.layers[name].downloaded_size = self.layers[name].total_size
-                self.layers[name].status = 'completed'
+                layer = self.layers[name]
+                if layer.total_size == 0:
+                    layer.total_size = layer.downloaded_size
+                else:
+                    layer.downloaded_size = layer.total_size
+                layer.status = 'completed'
         self._refresh_display()
 
     def set_chunk_info(self, name: str, current: int, total: int):
@@ -559,6 +571,8 @@ def download_file_with_progress(
                     total_size = int(content_range.split('/')[1])
                 else:
                     total_size = int(resp.headers.get('content-length', 0)) + resume_pos
+
+                progress_display.update_layer_size(desc, total_size)
 
                 if total_size - resume_pos > CHUNK_THRESHOLD and resume_pos == 0:
                     return download_file_in_chunks(
@@ -1051,9 +1065,8 @@ def main():
             for key, site in MIRROR_SITES.items():
                 print(f"  {key}. {site['name']} ({site['registry']})")
             print("  0. 输入自定义仓库地址")
-            print("  回车. 使用默认 Docker Hub")
             
-            choice = input("\n请选择镜像站（默认 1）：").strip() or "1"
+            choice = input("\n请选择镜像站（为空不额外添加镜像站前缀）：").strip() or "-1"
             
             if choice == "0":
                 args.custom_registry = input("请输入自定义仓库地址：").strip() or None
