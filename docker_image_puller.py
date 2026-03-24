@@ -31,7 +31,19 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 urllib3.disable_warnings()
 
-VERSION = "v1.8.0"
+VERSION = "v1.9.0"
+
+MIRROR_SITES = {
+    "1": {"name": "Docker Hub (官方)", "registry": "registry-1.docker.io"},
+    "2": {"name": "1ms.run", "registry": "docker.1ms.run"},
+    "3": {"name": "xuanyuan", "registry": "docker.xuanyuan.me"},
+    "4": {"name": "DaoCloud - Docker Hub", "registry": "docker.m.daocloud.io"},
+    "5": {"name": "DaoCloud - K8s", "registry": "k8s.m.daocloud.io"},
+    "6": {"name": "DaoCloud - NVCR", "registry": "nvcr.m.daocloud.io"},
+    "7": {"name": "DaoCloud - GCR", "registry": "gcr.m.daocloud.io"},
+    "8": {"name": "DaoCloud - GHCR", "registry": "ghcr.m.daocloud.io"},
+    "9": {"name": "DaoCloud - Quay", "registry": "quay.m.daocloud.io"},
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,7 +67,7 @@ def signal_handler(signum, frame):
         sys.exit(1)
     
     stop_event.set()
-    print('\n⚠️ 收到中断信号，正在保存进度并优雅退出...')
+    print('\n⚠️ 收到中断信号，正在保存进度并退出...')
     print('💡 再次按 Ctrl+C 强制退出')
 
 
@@ -992,7 +1004,21 @@ def main():
                 return
 
         if not args.custom_registry and not args.quiet:
-            args.custom_registry = input("请输入自定义仓库地址（默认 dockerhub）：").strip() or None
+            print("\n📋 可用的镜像站：")
+            for key, site in MIRROR_SITES.items():
+                print(f"  {key}. {site['name']} ({site['registry']})")
+            print("  0. 输入自定义仓库地址")
+            print("  回车. 使用默认 Docker Hub")
+            
+            choice = input("\n请选择镜像站（默认 1）：").strip() or "1"
+            
+            if choice == "0":
+                args.custom_registry = input("请输入自定义仓库地址：").strip() or None
+            elif choice in MIRROR_SITES:
+                args.custom_registry = MIRROR_SITES[choice]["registry"]
+                logger.info(f"✅ 已选择镜像站：{MIRROR_SITES[choice]['name']}")
+            else:
+                args.custom_registry = None
 
         image_info = parse_image_input(args.image, args.custom_registry)
 

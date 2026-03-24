@@ -18,7 +18,7 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', 'topcss'),
             StringStruct('FileDescription', 'Docker Image Puller - 无需安装 Docker 或 Python 环境，直接从 Docker 仓库拉取镜像，支持断点续传和多架构'),
-            StringStruct('FileVersion', '1.7.0.0'),
+            StringStruct('FileVersion', '1.9.0.0'),
             StringStruct('InternalName', 'DockerPull'),
             StringStruct('LegalCopyright', 'MIT License | GitHub: https://github.com/topcss/docker-pull-tar'),
             StringStruct('OriginalFilename', 'DockerPull.exe'),
