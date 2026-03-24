@@ -37,12 +37,13 @@ MIRROR_SITES = {
     "1": {"name": "Docker Hub (官方)", "registry": "registry-1.docker.io"},
     "2": {"name": "1ms.run", "registry": "docker.1ms.run"},
     "3": {"name": "xuanyuan", "registry": "docker.xuanyuan.me"},
-    "4": {"name": "DaoCloud - Docker Hub", "registry": "docker.m.daocloud.io"},
-    "5": {"name": "DaoCloud - K8s", "registry": "k8s.m.daocloud.io"},
-    "6": {"name": "DaoCloud - NVCR", "registry": "nvcr.m.daocloud.io"},
-    "7": {"name": "DaoCloud - GCR", "registry": "gcr.m.daocloud.io"},
-    "8": {"name": "DaoCloud - GHCR", "registry": "ghcr.m.daocloud.io"},
-    "9": {"name": "DaoCloud - Quay", "registry": "quay.m.daocloud.io"},
+    "4": {"name": "xuanyuan(付费)", "registry": "docker.xuanyuan.cloud"},
+    "5": {"name": "DaoCloud - Docker Hub", "registry": "docker.m.daocloud.io"},
+    "6": {"name": "DaoCloud - K8s", "registry": "k8s.m.daocloud.io"},
+    "7": {"name": "DaoCloud - NVCR", "registry": "nvcr.m.daocloud.io"},
+    "8": {"name": "DaoCloud - GCR", "registry": "gcr.m.daocloud.io"},
+    "9": {"name": "DaoCloud - GHCR", "registry": "ghcr.m.daocloud.io"},
+    "10": {"name": "DaoCloud - Quay", "registry": "quay.m.daocloud.io"},
 }
 
 logging.basicConfig(
@@ -686,26 +687,19 @@ def download_file_in_chunks(
                 stats.start_time = time.time()
         
         sha256_hash = hashlib.sha256() if expected_digest else None
+        completed_chunks = [False] * num_chunks
+        chunk_sizes = [end - start for start, end, _ in chunk_files]
         
-        for i, (start, end, chunk_file) in enumerate(chunk_files):
+        def download_single_chunk(i: int, start: int, end: int, chunk_file: str) -> bool:
             if stop_event.is_set():
                 return False
-            
-            progress_display.set_chunk_info(desc, i + 1, num_chunks)
             
             if os.path.exists(chunk_file):
                 existing_size = os.path.getsize(chunk_file)
                 if existing_size == end - start:
-                    if sha256_hash:
-                        with open(chunk_file, 'rb') as f:
-                            while True:
-                                data = f.read(65536)
-                                if not data:
-                                    break
-                                sha256_hash.update(data)
-                    completed_size += (end - start)
-                    progress_display.update_layer(desc, completed_size)
-                    continue
+                    return True
+                else:
+                    os.remove(chunk_file)
             
             chunk_headers = headers.copy()
             chunk_headers['Range'] = f'bytes={start}-{end-1}'
@@ -715,7 +709,6 @@ def download_file_in_chunks(
                     return False
                 
                 try:
-                    chunk_downloaded = 0
                     with session.get(url, headers=chunk_headers, verify=False, timeout=120, stream=True) as resp:
                         resp.raise_for_status()
                         
@@ -725,19 +718,62 @@ def download_file_in_chunks(
                                     return False
                                 if data:
                                     f.write(data)
-                                    chunk_downloaded += len(data)
-                                    completed_size += len(data)
-                                    if sha256_hash:
-                                        sha256_hash.update(data)
-                                    progress_display.update_layer(desc, completed_size)
-                        break
+                        
+                        if os.path.getsize(chunk_file) == end - start:
+                            return True
+                        else:
+                            if os.path.exists(chunk_file):
+                                os.remove(chunk_file)
+                            if attempt < max_retries - 1:
+                                wait_time = min(2 ** attempt, 60)
+                                time.sleep(wait_time)
+                                continue
+                            return False
                 except Exception as e:
                     if attempt < max_retries - 1:
                         wait_time = min(2 ** attempt, 60)
+                        logger.debug(f'{desc} 分片 {i+1} 下载失败，{wait_time}秒后重试: {e}')
                         time.sleep(wait_time)
+                        continue
                     else:
-                        logger.error(f'❌ {desc}: 分片 {i+1} 下载失败')
-                        raise
+                        logger.error(f'❌ {desc} 分片 {i+1} 下载失败: {e}')
+                        return False
+            
+            return False
+        
+        max_workers = min(num_chunks, 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for i, (start, end, chunk_file) in enumerate(chunk_files):
+                if os.path.exists(chunk_file) and os.path.getsize(chunk_file) == end - start:
+                    completed_chunks[i] = True
+                    continue
+                futures[executor.submit(download_single_chunk, i, start, end, chunk_file)] = i
+            
+            while futures:
+                for future in list(futures.keys()):
+                    if future.done():
+                        i = futures.pop(future)
+                        try:
+                            result = future.result()
+                            if result:
+                                completed_chunks[i] = True
+                                progress_display.set_chunk_info(desc, sum(completed_chunks), num_chunks)
+                            else:
+                                logger.error(f'❌ {desc} 分片 {i+1} 下载失败')
+                                return False
+                        except Exception as e:
+                            logger.error(f'❌ {desc} 分片 {i+1} 下载异常: {e}')
+                            return False
+                
+                current_completed = sum(1 for c in completed_chunks if c)
+                current_size = sum(chunk_sizes[i] for i in range(num_chunks) if completed_chunks[i])
+                progress_display.update_layer(desc, current_size)
+                progress_display.set_chunk_info(desc, current_completed, num_chunks)
+                
+                time.sleep(0.1)
+        
+        logger.info(f'{desc}: 合并 {num_chunks} 个分片...')
         
         with open(save_path, 'wb') as outfile:
             for i, (_, _, chunk_file) in enumerate(chunk_files):
@@ -750,6 +786,8 @@ def download_file_in_chunks(
                         if not data:
                             break
                         outfile.write(data)
+                        if sha256_hash:
+                            sha256_hash.update(data)
         
         shutil.rmtree(temp_dir, ignore_errors=True)
         
