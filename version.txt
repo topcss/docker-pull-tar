@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 7, 0),
-    prodvers=(1, 0, 7, 0),
+    filevers=(1, 6, 1, 0),
+    prodvers=(1, 6, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x4,
@@ -17,13 +17,13 @@ VSVersionInfo(
           '040904B0',
           [
             StringStruct('CompanyName', 'topcss'),
-            StringStruct('FileDescription', 'Docker Image Puller 无需安装 Docker 或 Python 环境，直接从 Docker 仓库拉取镜像，支持国内镜像源加速和多架构支持。项目地址：https://github.com/topcss/docker-pull-tar'),
-            StringStruct('FileVersion', '1.0.7.0'),
+            StringStruct('FileDescription', 'Docker Image Puller - 无需安装 Docker 或 Python 环境，直接从 Docker 仓库拉取镜像，支持断点续传和多架构'),
+            StringStruct('FileVersion', '1.9.0.0'),
             StringStruct('InternalName', 'DockerPull'),
             StringStruct('LegalCopyright', 'MIT License | GitHub: https://github.com/topcss/docker-pull-tar'),
             StringStruct('OriginalFilename', 'DockerPull.exe'),
             StringStruct('ProductName', 'DockerPull'),
-            StringStruct('ProductVersion', '1.0.7.0')
+            StringStruct('ProductVersion', '1.8.0.0')
           ]
         )
       ]

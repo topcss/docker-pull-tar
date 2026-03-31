@@ -4,3 +4,5 @@ test.py
 dist/
 build/
 *.spec
+*.zip
+*.tar
