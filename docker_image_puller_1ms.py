@@ -56,6 +56,13 @@ stop_event = threading.Event()
 progress_lock = threading.Lock()
 original_sigint_handler = None
 
+# 下载路径性能参数（偏向“快速失败 + 快速重试”）
+CONNECT_TIMEOUT = 8
+READ_TIMEOUT = 120
+DOWNLOAD_MAX_RETRIES = 4
+BACKOFF_BASE = 0.3
+MAX_PARALLEL_LAYERS = 8
+
 
 def signal_handler(signum, frame):
     global stop_event
@@ -163,7 +170,11 @@ class ProgressDisplay:
     def update_layer_size(self, name: str, total_size: int):
         with progress_lock:
             if name in self.layers:
-                self.layers[name].set_total_size(total_size)
+                # 仅在拿到有效大小时更新，避免把已知大小覆盖成 0
+                if total_size and total_size > 0:
+                    old_size = self.layers[name].total_size
+                    self.layers[name].set_total_size(max(old_size, total_size))
+        self._refresh_display(force=True)
 
     def complete_layer(self, name: str):
         with progress_lock:
@@ -174,7 +185,7 @@ class ProgressDisplay:
                 else:
                     layer.downloaded_size = layer.total_size
                 layer.status = "completed"
-        self._refresh_display()
+        self._refresh_display(force=True)
 
     def set_chunk_info(self, name: str, current: int, total: int):
         with progress_lock:
@@ -191,9 +202,9 @@ class ProgressDisplay:
             self.last_line_count = len(self.layers) + (1 if self.stats else 0)
             self.initialized = True
 
-    def _refresh_display(self):
+    def _refresh_display(self, force: bool = False):
         now = time.time()
-        if now - self.last_update < self.update_interval:
+        if not force and now - self.last_update < self.update_interval:
             return
         self.last_update = now
 
@@ -218,17 +229,23 @@ class ProgressDisplay:
             sys.stdout.flush()
 
     def _format_layer_line(self, layer: LayerProgress) -> str:
-        progress = (layer.downloaded_size / layer.total_size) if layer.total_size > 0 else 0.0
+        if layer.total_size > 0:
+            progress = layer.downloaded_size / layer.total_size
+            progress_text = f"{progress*100:5.1f}%"
+        else:
+            progress = 1.0 if layer.status == "completed" else 0.0
+            progress_text = "100.0%" if layer.status == "completed" else "  --.-%"
         filled = int(self.bar_width * progress)
         empty = self.bar_width - filled
         bar = "█" * filled + "░" * empty
-        size_str = f"{layer.format_size(layer.downloaded_size)}/{layer.format_size(layer.total_size)}"
+        total_size_str = layer.format_size(layer.total_size) if layer.total_size > 0 else "?"
+        size_str = f"{layer.format_size(layer.downloaded_size)}/{total_size_str}"
         chunk_info = f" [{layer.current_chunk}/{layer.total_chunks}]" if layer.total_chunks > 0 else ""
         status_icon = "✅" if layer.status == "completed" else "⬇️"
         total_layers_str = str(layer.total_layers)
         index_str = str(layer.index).rjust(len(total_layers_str))
         layer_info = f"({index_str}/{total_layers_str})"
-        return f"  {status_icon} {layer_info} {layer.name:<12} |{bar}| {progress*100:5.1f}% {size_str:>15}{chunk_info}"
+        return f"  {status_icon} {layer_info} {layer.name:<12} |{bar}| {progress_text} {size_str:>15}{chunk_info}"
 
 
 progress_display = ProgressDisplay()
@@ -247,15 +264,15 @@ class SessionManager:
     def _create_session(cls) -> requests.Session:
         session = requests.Session()
         retry_strategy = Retry(
-            total=10,
-            backoff_factor=3,
+            total=3,
+            backoff_factor=0.3,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET", "HEAD", "OPTIONS"],
         )
-        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=50, pool_block=False)
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=64, pool_maxsize=128, pool_block=False)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
-        session.timeout = (60, 600)
+        session.timeout = (CONNECT_TIMEOUT, READ_TIMEOUT)
         session.proxies = {
             "http": os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy"),
             "https": os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy"),
@@ -426,7 +443,7 @@ class DownloadProgressManager:
 
 def get_file_size(session: requests.Session, url: str, headers: Dict[str, str]) -> int:
     try:
-        resp = session.head(url, headers=headers, verify=False, timeout=30)
+        resp = session.head(url, headers=headers, verify=False, timeout=(CONNECT_TIMEOUT, 5))
         if resp.status_code == 200:
             return int(resp.headers.get("content-length", 0))
     except Exception:
@@ -442,7 +459,7 @@ def download_file_in_chunks(
     desc: str,
     total_size: int,
     expected_digest: Optional[str] = None,
-    max_retries: int = 10,
+    max_retries: int = DOWNLOAD_MAX_RETRIES,
     stats: Optional[DownloadStats] = None,
     chunk_size: int = 10 * 1024 * 1024,
 ) -> bool:
@@ -479,7 +496,9 @@ def download_file_in_chunks(
                 if stop_event.is_set():
                     return False
                 try:
-                    with session.get(url, headers=chunk_headers, verify=False, timeout=120, stream=True) as resp:
+                    with session.get(
+                        url, headers=chunk_headers, verify=False, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), stream=True
+                    ) as resp:
                         resp.raise_for_status()
                         with open(chunk_file, "wb") as f:
                             for data in resp.iter_content(chunk_size=65536):
@@ -490,13 +509,13 @@ def download_file_in_chunks(
                     return os.path.getsize(chunk_file) == end - start
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        time.sleep(min(2**attempt, 60))
+                        time.sleep(min(BACKOFF_BASE * (2**attempt), 2))
                         continue
                     logger.error(f"❌ {desc} 分片 {i+1} 下载失败: {e}")
                     return False
             return False
 
-        max_workers = min(num_chunks, 4)
+        max_workers = min(num_chunks, MAX_PARALLEL_LAYERS)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures: Dict[Any, int] = {}
             for i, (start, end, chunk_file) in enumerate(chunk_files):
@@ -518,7 +537,7 @@ def download_file_in_chunks(
                 current_size = sum(chunk_sizes[i] for i in range(num_chunks) if completed_chunks[i])
                 progress_display.update_layer(desc, current_size)
                 progress_display.set_chunk_info(desc, current_completed, num_chunks)
-                time.sleep(0.1)
+                time.sleep(0.03)
 
         sha256_hash = hashlib.sha256() if expected_digest else None
         with open(save_path, "wb") as outfile:
@@ -559,7 +578,7 @@ def download_file_with_progress(
     save_path: str,
     desc: str,
     expected_digest: Optional[str] = None,
-    max_retries: int = 10,
+    max_retries: int = DOWNLOAD_MAX_RETRIES,
     stats: Optional[DownloadStats] = None,
 ) -> bool:
     CHUNK_THRESHOLD = 50 * 1024 * 1024
@@ -579,7 +598,9 @@ def download_file_with_progress(
             download_headers["Range"] = f"bytes={resume_pos}-"
 
         try:
-            with session.get(url, headers=download_headers, verify=False, timeout=120, stream=True) as resp:
+            with session.get(
+                url, headers=download_headers, verify=False, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), stream=True
+            ) as resp:
                 if resp.status_code == 416:
                     progress_display.complete_layer(desc)
                     return True
@@ -643,7 +664,7 @@ def download_file_with_progress(
                             os.remove(save_path)
                         except Exception:
                             pass
-                        time.sleep(min(2**attempt, 60))
+                        time.sleep(min(BACKOFF_BASE * (2**attempt), 2))
                         continue
 
                 progress_display.complete_layer(desc)
@@ -653,19 +674,19 @@ def download_file_with_progress(
             return False
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             if attempt < max_retries - 1:
-                time.sleep(min(2**attempt, 60))
+                time.sleep(min(BACKOFF_BASE * (2**attempt), 2))
                 continue
             logger.error(f"❌ {desc} 下载失败: {e}")
             return False
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code in [429, 500, 502, 503, 504] and attempt < max_retries - 1:
-                time.sleep(min(2**attempt, 60))
+                time.sleep(min(BACKOFF_BASE * (2**attempt), 2))
                 continue
             logger.error(f"❌ {desc} 下载失败: {e}")
             return False
         except Exception as e:
             if attempt < max_retries - 1:
-                time.sleep(min(2**attempt, 60))
+                time.sleep(min(BACKOFF_BASE * (2**attempt), 2))
                 continue
             logger.error(f"❌ {desc} 下载失败: {e}")
             return False
@@ -698,6 +719,7 @@ def download_layers(
 
     # Config
     config_digest = resp_json["config"]["digest"]
+    config_size = int(resp_json.get("config", {}).get("size") or 0)
     config_filename = f"{config_digest[7:]}.json"
     config_path = os.path.join(imgdir, config_filename)
     config_url = f"https://{registry}/v2/{repository}/blobs/{config_digest}"
@@ -706,7 +728,7 @@ def download_layers(
         logger.info("✅ Config 已存在，跳过下载")
     else:
         progress_manager.update_config_status("downloading", digest=config_digest)
-        config_size = get_file_size(session, config_url, auth_head)
+        # 性能优先：不在下载前串行 HEAD 探测大小，避免首屏等待
         progress_display.add_layer("Config", config_size, 0, len(layers) + 1)
         if not download_file_with_progress(session, config_url, auth_head, config_path, "Config", expected_digest=config_digest, stats=stats):
             progress_manager.update_config_status("failed")
@@ -717,7 +739,7 @@ def download_layers(
     parentid = ""
     layer_json_map: Dict[str, Dict[str, Any]] = {}
 
-    layers_to_download: List[Tuple[str, str, str, str]] = []
+    layers_to_download: List[Tuple[str, str, str, str, int]] = []
     skipped_count = 0
 
     for layer in layers:
@@ -732,27 +754,39 @@ def download_layers(
         if progress_manager.is_layer_completed(ublob) and os.path.exists(save_path):
             skipped_count += 1
         else:
-            layers_to_download.append((ublob, fake_layerid, layerdir, save_path))
+            known_size = int(layer.get("size") or 0)
+            layers_to_download.append((ublob, fake_layerid, layerdir, save_path, known_size))
 
     if skipped_count:
         logger.info(f"📦 跳过 {skipped_count} 个已下载的层，还需下载 {len(layers_to_download)} 个层")
 
-    for idx, (ublob, _, _, _) in enumerate(layers_to_download):
-        url = f"https://{registry}/v2/{repository}/blobs/{ublob}"
-        layer_size = get_file_size(session, url, auth_head)
-        progress_display.add_layer(ublob[:12], layer_size, idx + 1, len(layers_to_download))
+    # 性能优先：直接启动下载；优先使用 manifest 已提供的 size 预填
+    for idx, (ublob, _, _, _, known_size) in enumerate(layers_to_download):
+        progress_display.add_layer(ublob[:12], known_size, idx + 1, len(layers_to_download))
 
     progress_display.print_initial()
 
-    num_workers = min(len(layers_to_download), 4) if layers_to_download else 1
+    num_workers = min(len(layers_to_download), MAX_PARALLEL_LAYERS) if layers_to_download else 1
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures: Dict[Any, Tuple[str, str]] = {}
-        for ublob, _, _, save_path in layers_to_download:
+        for ublob, _, _, save_path, _ in layers_to_download:
             if stop_event.is_set():
                 raise KeyboardInterrupt
             url = f"https://{registry}/v2/{repository}/blobs/{ublob}"
             progress_manager.update_layer_status(ublob, "downloading")
-            futures[executor.submit(download_file_with_progress, session, url, auth_head, save_path, ublob[:12], ublob, 10, stats)] = (ublob, save_path)
+            futures[
+                executor.submit(
+                    download_file_with_progress,
+                    session,
+                    url,
+                    auth_head,
+                    save_path,
+                    ublob[:12],
+                    ublob,
+                    DOWNLOAD_MAX_RETRIES,
+                    stats,
+                )
+            ] = (ublob, save_path)
 
         for future in as_completed(futures):
             if stop_event.is_set():
@@ -876,6 +910,14 @@ def _fmt_time(t: str) -> str:
     return t.split(".")[0]
 
 
+def _fmt_time_compact(t: str) -> str:
+    # 搜索结果里的更新时间只保留到分钟，避免列太长影响阅读
+    formatted = _fmt_time(t)
+    if len(formatted) >= 16:
+        return formatted[:16]
+    return formatted
+
+
 def _max_last_pushed(images: List[Dict[str, Any]]) -> str:
     # 字符串排序对 ISO8601 基本可用（同一格式）
     times = [img.get("last_pushed") for img in images if img.get("last_pushed")]
@@ -895,7 +937,7 @@ def interactive_tag_select(
     session: requests.Session,
     api_base: str,
     repositories: str,
-    page_size: int = 10,
+    page_size: int = 8,
     default_tag: str = "latest",
 ) -> Tuple[str, Dict[str, Any]]:
     """
@@ -1001,7 +1043,7 @@ def interactive_search_and_select(
     session: requests.Session,
     api_base: str,
     keyword: str,
-    page_size: int = 25,
+    page_size: int = 10,
 ) -> Tuple[Dict[str, Any], int]:
     page = 1
     while True:
@@ -1019,11 +1061,12 @@ def interactive_search_and_select(
             desc = (it.get("description") or "").strip().replace("\n", " ")
             pulls = format_big_number(it.get("pull_count", 0))
             stars = format_big_number(it.get("star_count", 0))
-            last = it.get("last_updated", "") or it.get("last_modified", "")
+            last = _fmt_time_compact(it.get("last_updated", "") or it.get("last_modified", ""))
             show_name = f"{ns}/{name}" if ns else name
             print(f"{idx:>2}. {show_name:<35} ⭐{stars:<8} ⬇{pulls:<10}  {last}")
             if desc:
                 print(f"    {desc[:120]}")
+
 
         print("-" * 80)
         print("输入：序号=选择  n=下一页  p=上一页  g=跳页  k=换关键词  q=退出")
@@ -1133,7 +1176,7 @@ def main():
         parser.add_argument("-k", "--keyword", help="关键词（不传则启动后交互输入）")
         parser.add_argument("--api", default=DEFAULT_1MS_API, help=f"1ms API 地址，默认：{DEFAULT_1MS_API}")
         parser.add_argument("--registry", default=DEFAULT_1MS_REGISTRY, help=f"1ms registry 地址，默认：{DEFAULT_1MS_REGISTRY}")
-        parser.add_argument("--page-size", type=int, default=25, help="搜索分页大小，默认 25")
+        parser.add_argument("--page-size", type=int, default=10, help="搜索分页大小，默认 10")
         parser.add_argument("-t", "--tag", default="", help="镜像 tag（不传则从 1ms tag 列表中选择）")
         parser.add_argument("-a", "--arch", default="amd64", help="默认架构（当存在多架构时作为默认值），默认 amd64")
         parser.add_argument("-o", "--output", help="输出目录，默认当前目录")
@@ -1207,7 +1250,7 @@ def main():
                 session=session,
                 api_base=args.api,
                 repositories=repositories,
-                page_size=10,
+                page_size=8,
                 default_tag="latest",
             )
         args.tag = chosen_tag
