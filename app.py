@@ -5,6 +5,7 @@ import os
 import shutil
 import threading
 import time
+import math  # 新增 math 库用于计算页数
 import urllib.request
 import warnings
 
@@ -23,7 +24,7 @@ from pathlib import Path
 import gradio as gr
 
 # 配置参数
-VERSION = "v2.0.1-Gradio7-Web"
+VERSION = "v2.0.2-Gradio7-Web"
 DEFAULT_1MS_API = "https://1ms.run/api/v1/registry"
 CONNECT_TIMEOUT = 8
 READ_TIMEOUT = 120
@@ -104,7 +105,6 @@ class WebProgressDisplay:
                 layer.status = "completed"
 
     def get_html_content(self) -> str:
-        """生成美观的 HTML & CSS 进度条日志，消除闪烁"""
         with self.lock:
             if self.error_msg:
                 return f"""
@@ -158,7 +158,6 @@ class WebProgressDisplay:
             """)
 
             if self.is_done:
-                # 🟡 优化：高对比度、清晰可见的完成提示卡片
                 html.append(f"""
                     <div style="margin-top: 15px; padding: 15px; background-color: #e8f5e9; color: #1b5e20; border: 1px solid #a5d6a7; border-radius: 6px; font-family: sans-serif;">
                         <div style="font-size: 16px; font-weight: bold; margin-bottom: 10px;">🎉 所有组件下载并打包完成!</div>
@@ -401,7 +400,6 @@ def pull_image_logic(progress: WebProgressDisplay, registry, repository, tag, ar
 # UI 交互函数与文件管理
 # --------------------------
 def get_downloaded_tars(out_dir):
-    """扫描目录下的所有 .tar 文件给前端展示"""
     if not out_dir: out_dir = "downloads"
     os.makedirs(out_dir, exist_ok=True)
     files = []
@@ -409,7 +407,6 @@ def get_downloaded_tars(out_dir):
         for f in os.listdir(out_dir):
             if f.endswith(".tar"):
                 files.append(os.path.join(out_dir, f))
-        # 按修改时间排序，最新的在前面
         files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
     except Exception:
         pass
@@ -419,7 +416,6 @@ def get_downloaded_tars(out_dir):
 
 
 def delete_local_tar(filename, out_dir):
-    """删除指定的 tar 文件"""
     if filename:
         filepath = os.path.join(out_dir, filename)
         if os.path.exists(filepath):
@@ -431,14 +427,27 @@ def delete_local_tar(filename, out_dir):
     return get_downloaded_tars(out_dir)
 
 
-def fn_search(keyword, p_mode, p_host, p_user, p_pass, vSSL):
-    if not keyword: return []
+# 🌟 新增：带分页的核心搜索函数
+def execute_search(keyword, target_page, p_mode, p_host, p_user, p_pass, vSSL):
+    if not keyword:
+        return [], 1, "<div style='text-align:center;'>请先输入关键词</div>", gr.update(interactive=False), gr.update(
+            interactive=False)
+
     proxies = apply_proxy_config(p_mode, p_host, p_user, p_pass)
     session = get_session(vSSL, proxies)
+    page_size = 20
     try:
-        resp = session.get(f"{DEFAULT_1MS_API}/search", params={"query": keyword, "page": 1, "page_size": 20})
+        resp = session.get(f"{DEFAULT_1MS_API}/search",
+                           params={"query": keyword, "page": target_page, "page_size": page_size})
         resp.raise_for_status()
-        items = resp.json().get("data", {}).get("list", [])
+        data = resp.json().get("data", {})
+        items = data.get("list", [])
+        total = data.get("total", 0)
+
+        # 计算总页数和当前限制
+        total_pages = max(1, math.ceil(total / page_size))
+        actual_page = min(max(1, target_page), total_pages)
+
         res = []
         for it in items:
             ns = it.get("namespace", "library")
@@ -451,7 +460,14 @@ def fn_search(keyword, p_mode, p_host, p_user, p_pass, vSSL):
                 it.get("last_modified", "")[:10],
                 (it.get("description") or "").replace("\n", "")[:50]
             ])
-        return res
+
+        html_info = f"<div style='text-align:center; padding-top:8px; color:#555; font-size:14px;'>第 <b>{actual_page}</b> / {total_pages} 页 (共 {total} 个结果)</div>"
+
+        can_prev = actual_page > 1
+        can_next = actual_page < total_pages
+
+        return res, actual_page, html_info, gr.update(interactive=can_prev), gr.update(interactive=can_next)
+
     except Exception as e:
         raise gr.Error(f"搜索失败: {str(e)}")
 
@@ -494,10 +510,8 @@ def fn_download_manager(repo, tag, arch, registry, out_dir, p_mode, p_host, p_us
 
     while t.is_alive():
         time.sleep(0.5)
-        # Yield 日志 HTML 以及跳过文件列表的更新
         yield progress.get_html_content(), gr.skip(), gr.skip()
 
-    # 🟡 优化：下载完成后自动重新加载第三步的文件管理器列表
     files, drop_update = get_downloaded_tars(out_dir)
     yield progress.get_html_content(), files, drop_update
 
@@ -509,6 +523,10 @@ with gr.Blocks(
         title="Docker 镜像离线下载工具",
         theme=gr.themes.Soft(primary_hue="blue")
 ) as demo:
+    # 🌟 新增：隐藏的 State，用于存储当前分页对应的关键词和页码，避免因用户乱改文本框导致翻页报错
+    current_kw_state = gr.State("")
+    current_page_state = gr.State(1)
+
     gr.Markdown(
         f"# 🐳 Docker 镜像快捷离线拉取器 ({VERSION})\n搜索、选择架构、一键导出 `.tar` 镜像包供离线环境 `docker load`。")
 
@@ -552,6 +570,13 @@ with gr.Blocks(
                 interactive=False, wrap=True, type="array", max_height=300
             )
 
+            # 🌟 新增：分页控件区域
+            with gr.Row():
+                prev_btn = gr.Button("◀ 上一页", interactive=False, size="sm")
+                page_info_ui = gr.HTML(
+                    "<div style='text-align:center; padding-top:8px; color:#999; font-size:14px;'>等待搜索...</div>")
+                next_btn = gr.Button("下一页 ▶", interactive=False, size="sm")
+
         with gr.Column(scale=3):
             gr.Markdown("### 🏷️ 步骤 2：选择并下载")
             selected_repo_ui = gr.Textbox(label="当前选中目标", placeholder="请从左侧表格中点击选择一项...",
@@ -569,7 +594,6 @@ with gr.Blocks(
                 value="<div style='color:#999; font-size:14px; text-align:center; padding: 20px; border: 1px dashed #ccc; border-radius: 8px;'>等待开始...</div>"
             )
 
-    # 🟡 优化：增加步骤 3 —— 独立的本地 TAR 文件管理器面板
     gr.Markdown("---\n### 📁 步骤 3：本地镜像包管理 (.tar)")
     with gr.Row():
         with gr.Column(scale=3):
@@ -583,13 +607,49 @@ with gr.Blocks(
             delete_dropdown = gr.Dropdown(label="🗑️ 选择要删除的文件")
             delete_btn = gr.Button("❌ 删除选中文件", variant="stop")
 
+
     # --------------------------
     # 事件绑定逻辑
     # --------------------------
+
+    # 🌟 修改：绑定首次搜索事件（重置为第1页），同步更新并保存 State 记录
+    def on_initial_search(kw, p_mode, p_host, p_user, p_pass, vSSL):
+        res, actual_page, html_info, can_prev, can_next = execute_search(kw, 1, p_mode, p_host, p_user, p_pass, vSSL)
+        return kw, res, actual_page, html_info, can_prev, can_next
+
+
     search_btn.click(
-        fn=fn_search,
+        fn=on_initial_search,
         inputs=[kw_ui, proxy_mode_ui, proxy_host_ui, proxy_user_ui, proxy_pass_ui, ssl_ui],
-        outputs=[df_results]
+        outputs=[current_kw_state, df_results, current_page_state, page_info_ui, prev_btn, next_btn]
+    )
+
+
+    # 🌟 新增：绑定上一页与下一页事件（基于保存的 State 进行操作）
+    def on_prev_page(saved_kw, current_page, p_mode, p_host, p_user, p_pass, vSSL):
+        res, actual_page, html_info, can_prev, can_next = execute_search(saved_kw, current_page - 1, p_mode, p_host,
+                                                                         p_user, p_pass, vSSL)
+        return res, actual_page, html_info, can_prev, can_next
+
+
+    def on_next_page(saved_kw, current_page, p_mode, p_host, p_user, p_pass, vSSL):
+        res, actual_page, html_info, can_prev, can_next = execute_search(saved_kw, current_page + 1, p_mode, p_host,
+                                                                         p_user, p_pass, vSSL)
+        return res, actual_page, html_info, can_prev, can_next
+
+
+    prev_btn.click(
+        fn=on_prev_page,
+        inputs=[current_kw_state, current_page_state, proxy_mode_ui, proxy_host_ui, proxy_user_ui, proxy_pass_ui,
+                ssl_ui],
+        outputs=[df_results, current_page_state, page_info_ui, prev_btn, next_btn]
+    )
+
+    next_btn.click(
+        fn=on_next_page,
+        inputs=[current_kw_state, current_page_state, proxy_mode_ui, proxy_host_ui, proxy_user_ui, proxy_pass_ui,
+                ssl_ui],
+        outputs=[df_results, current_page_state, page_info_ui, prev_btn, next_btn]
     )
 
 
@@ -626,7 +686,7 @@ with gr.Blocks(
     )
 
     # 文件管理器事件绑定
-    demo.load(  # 页面初始加载时获取已下载文件
+    demo.load(
         fn=get_downloaded_tars, inputs=[out_dir_ui], outputs=[file_list_ui, delete_dropdown]
     )
     refresh_btn.click(
