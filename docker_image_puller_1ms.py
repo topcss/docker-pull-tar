@@ -57,10 +57,12 @@ progress_lock = threading.Lock()
 original_sigint_handler = None
 
 # 下载路径性能参数（偏向“快速失败 + 快速重试”）
-CONNECT_TIMEOUT = 8
-READ_TIMEOUT = 120
-DOWNLOAD_MAX_RETRIES = 4
-BACKOFF_BASE = 0.3
+CONNECT_TIMEOUT = 15
+READ_TIMEOUT = 300
+STALL_TIMEOUT = 120  # 连续 120 秒无新数据视为 stall
+STALL_MIN_BYTES = 1024  # stall 检测：低于此速度（B/s）判定为卡死
+DOWNLOAD_MAX_RETRIES = 5
+BACKOFF_BASE = 0.5
 MAX_PARALLEL_LAYERS = 8
 
 
@@ -481,35 +483,67 @@ def download_file_in_chunks(
         def download_single_chunk(i: int, start: int, end: int, chunk_file: str) -> bool:
             if stop_event.is_set():
                 return False
-            if os.path.exists(chunk_file):
-                if os.path.getsize(chunk_file) == end - start:
-                    return True
-                try:
-                    os.remove(chunk_file)
-                except Exception:
-                    pass
+            chunk_size = end - start
 
-            chunk_headers = headers.copy()
-            chunk_headers["Range"] = f"bytes={start}-{end-1}"
+            # 断点续传：不完整分片从已有位置继续，不删除
+            resume_offset = 0
+            if os.path.exists(chunk_file):
+                current_size = os.path.getsize(chunk_file)
+                if current_size == chunk_size:
+                    return True
+                elif current_size > 0 and current_size < chunk_size:
+                    resume_offset = current_size
+                    logger.debug(f"📎 分片 {i+1} 从 {resume_offset} 字节处续传")
 
             for attempt in range(max_retries):
                 if stop_event.is_set():
                     return False
                 try:
+                    dl_start = start + resume_offset
+                    chunk_headers = headers.copy()
+                    chunk_headers["Range"] = f"bytes={dl_start}-{end-1}"
+
                     with session.get(
-                        url, headers=chunk_headers, verify=False, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), stream=True
+                        url, headers=chunk_headers, verify=False,
+                        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), stream=True
                     ) as resp:
+                        if resp.status_code == 416:
+                            # Range 不满足（可能已下完）
+                            if os.path.exists(chunk_file) and os.path.getsize(chunk_file) >= chunk_size:
+                                return True
                         resp.raise_for_status()
-                        with open(chunk_file, "wb") as f:
+
+                        mode = "ab" if resume_offset > 0 else "wb"
+                        stall_start = time.time()
+                        last_bytes = resume_offset
+
+                        with open(chunk_file, mode) as f:
                             for data in resp.iter_content(chunk_size=65536):
                                 if stop_event.is_set():
                                     return False
                                 if data:
                                     f.write(data)
-                    return os.path.getsize(chunk_file) == end - start
+                                    # stall 检测：用文件实际大小判断
+                                    current_pos = os.path.getsize(chunk_file)
+                                    now = time.time()
+                                    if current_pos > last_bytes:
+                                        stall_start = now
+                                        last_bytes = current_pos
+                                    elif now - stall_start > STALL_TIMEOUT:
+                                        logger.warning(f"⚠️ 分片 {i+1} stall 超时，重试...")
+                                        break
+
+                    final_size = os.path.getsize(chunk_file) if os.path.exists(chunk_file) else 0
+                    if final_size == chunk_size:
+                        return True
+                    # 大小不对，下次循环从断点续传
+                    resume_offset = final_size
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        time.sleep(min(BACKOFF_BASE * (2**attempt), 2))
+                        # 更新 resume_offset 以便下次续传
+                        if os.path.exists(chunk_file):
+                            resume_offset = os.path.getsize(chunk_file)
+                        time.sleep(min(BACKOFF_BASE * (2**attempt), 4))
                         continue
                     logger.error(f"❌ {desc} 分片 {i+1} 下载失败: {e}")
                     return False
@@ -524,20 +558,27 @@ def download_file_in_chunks(
                     continue
                 futures[executor.submit(download_single_chunk, i, start, end, chunk_file)] = i
 
+            failed_chunks = []
             while futures:
                 for future in list(futures.keys()):
                     if future.done():
                         i = futures.pop(future)
                         ok = future.result()
                         if not ok:
-                            return False
-                        completed_chunks[i] = True
+                            failed_chunks.append(i)
+                            logger.warning(f"⚠️ 分片 {i+1} 失败，等待其他分片完成...")
+                        else:
+                            completed_chunks[i] = True
 
                 current_completed = sum(1 for c in completed_chunks if c)
                 current_size = sum(chunk_sizes[i] for i in range(num_chunks) if completed_chunks[i])
                 progress_display.update_layer(desc, current_size)
                 progress_display.set_chunk_info(desc, current_completed, num_chunks)
                 time.sleep(0.03)
+
+            if failed_chunks:
+                logger.error(f"❌ {desc} 有 {len(failed_chunks)} 个分片下载失败: 分片 {failed_chunks}")
+                return False
 
         sha256_hash = hashlib.sha256() if expected_digest else None
         with open(save_path, "wb") as outfile:
@@ -664,7 +705,7 @@ def download_file_with_progress(
                             os.remove(save_path)
                         except Exception:
                             pass
-                        time.sleep(min(BACKOFF_BASE * (2**attempt), 2))
+                        time.sleep(min(BACKOFF_BASE * (2**attempt), 5))
                         continue
 
                 progress_display.complete_layer(desc)
@@ -674,19 +715,19 @@ def download_file_with_progress(
             return False
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             if attempt < max_retries - 1:
-                time.sleep(min(BACKOFF_BASE * (2**attempt), 2))
+                time.sleep(min(BACKOFF_BASE * (2**attempt), 5))
                 continue
             logger.error(f"❌ {desc} 下载失败: {e}")
             return False
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code in [429, 500, 502, 503, 504] and attempt < max_retries - 1:
-                time.sleep(min(BACKOFF_BASE * (2**attempt), 2))
+                time.sleep(min(BACKOFF_BASE * (2**attempt), 5))
                 continue
             logger.error(f"❌ {desc} 下载失败: {e}")
             return False
         except Exception as e:
             if attempt < max_retries - 1:
-                time.sleep(min(BACKOFF_BASE * (2**attempt), 2))
+                time.sleep(min(BACKOFF_BASE * (2**attempt), 5))
                 continue
             logger.error(f"❌ {desc} 下载失败: {e}")
             return False
@@ -788,17 +829,70 @@ def download_layers(
                 )
             ] = (ublob, save_path)
 
+        failed_layers = []
         for future in as_completed(futures):
             if stop_event.is_set():
                 raise KeyboardInterrupt
-            ublob, _ = futures[future]
-            ok = future.result()
+            ublob, save_path = futures[future]
+            try:
+                ok = future.result()
+            except Exception as e:
+                ok = False
+                logger.error(f"❌ 层 {ublob[:12]} 异常: {e}")
             if not ok:
                 progress_manager.update_layer_status(ublob, "failed")
-                raise RuntimeError(f"层 {ublob[:12]} 下载失败")
-            progress_manager.update_layer_status(ublob, "completed")
+                failed_layers.append((ublob, save_path))
+                logger.warning(f"⚠️ 层 {ublob[:12]} 下载失败")
+            else:
+                progress_manager.update_layer_status(ublob, "completed")
+
+    # 层级别重试：对失败的层重新下载，最多重试 2 轮
+    MAX_LAYER_RETRIES = 2
+    for retry_round in range(MAX_LAYER_RETRIES):
+        if not failed_layers:
+            break
+        if stop_event.is_set():
+            raise KeyboardInterrupt
+        logger.info(f"🔄 第 {retry_round + 1} 轮重试 {len(failed_layers)} 个失败层...")
+        retry_list = failed_layers
+        failed_layers = []
+
+        num_workers = min(len(retry_list), MAX_PARALLEL_LAYERS)
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures2: Dict[Any, Tuple[str, str]] = {}
+            for ublob, save_path in retry_list:
+                url = f"https://{registry}/v2/{repository}/blobs/{ublob}"
+                progress_manager.update_layer_status(ublob, "retrying")
+                futures2[
+                    executor.submit(
+                        download_file_with_progress,
+                        session, url, auth_head, save_path,
+                        ublob[:12], ublob, DOWNLOAD_MAX_RETRIES, stats,
+                    )
+                ] = (ublob, save_path)
+
+            for future in as_completed(futures2):
+                if stop_event.is_set():
+                    raise KeyboardInterrupt
+                ublob, save_path = futures2[future]
+                try:
+                    ok = future.result()
+                except Exception as e:
+                    ok = False
+                    logger.error(f"❌ 层 {ublob[:12]} 重试异常: {e}")
+                if not ok:
+                    progress_manager.update_layer_status(ublob, "failed")
+                    failed_layers.append((ublob, save_path))
+                else:
+                    progress_manager.update_layer_status(ublob, "completed")
 
     print()
+
+    if failed_layers:
+        failed_names = [ublob[:12] for ublob, _ in failed_layers]
+        logger.error(f"❌ 共 {len(failed_layers)} 个层下载失败: {', '.join(failed_names)}")
+        logger.error("💡 可重新运行程序，已成功的层会自动跳过")
+        raise RuntimeError(f"{len(failed_layers)} 个层下载失败，镜像不完整")
 
     # 解压 + 写 json
     for fake_layerid in layer_json_map.keys():
@@ -1171,6 +1265,8 @@ def build_image_info_from_search_item(registry: str, item: Dict[str, Any], tag: 
 
 
 def main():
+    imgdir = None
+    output_dir = Path.cwd()
     try:
         parser = argparse.ArgumentParser(description="1ms Docker 镜像下载专版（关键词搜索 + 一键下载）")
         parser.add_argument("-k", "--keyword", help="关键词（不传则启动后交互输入）")
@@ -1345,7 +1441,7 @@ def main():
             repo_key=repo_key,
         )
 
-        output_file = create_image_tar(imgdir, image_info.repository, image_info.tag, args.arch, output_dir)
+        output_file = create_image_tar(imgdir, image_info.repository, image_info.tag, args.arch, Path.cwd())
         logger.info(f"✅ 镜像已保存为: {output_file}")
         logger.info(f"💡 导入命令: docker load -i {output_file}")
         logger.info(f"💡 如需改名/打 tag: docker tag {repo_tag} 你的新名字:tag")
@@ -1362,6 +1458,17 @@ def main():
 
         logger.debug(traceback.format_exc())
     finally:
+        # 无论成功失败，清理临时目录
+        try:
+            if imgdir and os.path.exists(imgdir):
+                shutil.rmtree(imgdir, ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            if output_dir and output_dir.exists() and output_dir != Path.cwd():
+                shutil.rmtree(output_dir, ignore_errors=True)
+        except Exception:
+            pass
         cleanup_tmp_dir()
 
 
