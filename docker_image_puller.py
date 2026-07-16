@@ -845,7 +845,8 @@ def download_layers(
     img: str,
     tag: str,
     arch: str,
-    output_dir: Path
+    output_dir: Path,
+    workers: int
 ):
     global progress_display
     progress_display = ProgressDisplay()
@@ -915,7 +916,7 @@ def download_layers(
 
     progress_display.print_initial()
 
-    num_workers = min(len(layers_to_download), 4) if layers_to_download else 1
+    num_workers = min(len(layers_to_download), max(1, workers)) if layers_to_download else 1
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = {}
@@ -1227,7 +1228,7 @@ def main():
             session, image_info.registry, image_info.repository,
             resp_json['layers'], auth_head, imgdir, resp_json,
             imgparts, image_info.image_name, image_info.tag, args.arch,
-            output_dir
+            output_dir, args.workers
         )
 
         output_file = create_image_tar(imgdir, image_info.repository, image_info.tag, args.arch, output_dir)
